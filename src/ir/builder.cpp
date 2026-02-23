@@ -165,6 +165,8 @@ public:
 
     // Inline a user-defined function call. Returns the expression for the return value.
     ExprPtr lowerUserFunction(const slang::ast::CallExpression& call);
+    uint32_t nextInlineCounter() { return inlineCounter_++; }
+    const std::unordered_map<uint32_t, ExprPtr>& blockValues() const { return blockValues_; }
 
 private:
     Module& mod_;
@@ -862,11 +864,122 @@ private:
             auto& assign = expr.as<slang::ast::AssignmentExpression>();
             lowerAssignment(assign);
         } else if (expr.kind == slang::ast::ExpressionKind::Call) {
-            // System tasks ($display, etc.) or void function calls — lower as expression
-            // (system tasks return 0 and have no side effects in our model)
-            el_.lower(expr);
+            auto& call = expr.as<slang::ast::CallExpression>();
+            if (!call.isSystemCall()) {
+                // User-defined task/function call with potential output arguments
+                lowerTaskCall(call);
+            } else {
+                // System tasks ($display, etc.) — silently ignore
+                el_.lower(expr);
+            }
         }
         // Other expression statements (e.g., increment) — silently skip
+    }
+
+    void lowerTaskCall(const slang::ast::CallExpression& call) {
+        auto* sub = std::get<const slang::ast::SubroutineSymbol*>(call.subroutine);
+        if (!sub) return;
+
+        auto formalArgs = sub->getArguments();
+        auto actualArgs = call.arguments();
+
+        std::string prefix = "$" + std::string(sub->name) + "$" +
+                             std::to_string(el_.nextInlineCounter()) + "$";
+
+        auto savedBlockValues = el_.saveBlockValues();
+        auto& symMap = el_.symbolMapMut();
+
+        // Track output argument mappings: formal signal idx → actual LHS info
+        struct OutputBinding {
+            uint32_t formalSigIdx;
+            uint32_t actualSigIdx;
+        };
+        std::vector<OutputBinding> outputBindings;
+
+        for (size_t i = 0; i < formalArgs.size() && i < actualArgs.size(); i++) {
+            auto& formal = *formalArgs[i];
+            uint32_t argWidth = getTypeWidth(formal.getType());
+            uint32_t argSigIdx = mod_.addSignal(prefix + std::string(formal.name),
+                                                argWidth, SignalKind::Internal);
+            symMap[&formal] = argSigIdx;
+
+            auto dir = formal.direction;
+            if (dir == slang::ast::ArgumentDirection::Out) {
+                // Output-only: no input value, just create signal
+                el_.setBlockValue(argSigIdx, Expr::constant(argWidth, 0));
+
+                // Extract actual LHS from the argument
+                auto* actualExpr = actualArgs[i];
+                // Unwrap conversion if present
+                while (actualExpr->kind == slang::ast::ExpressionKind::Conversion)
+                    actualExpr = &actualExpr->as<slang::ast::ConversionExpression>().operand();
+                if (actualExpr->kind == slang::ast::ExpressionKind::Assignment) {
+                    auto& ae = actualExpr->as<slang::ast::AssignmentExpression>();
+                    auto& lhs = ae.left();
+                    if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
+                        uint32_t sigIdx = resolveSignalIndex(
+                            lhs.as<slang::ast::NamedValueExpression>().symbol);
+                        if (sigIdx != UINT32_MAX)
+                            outputBindings.push_back({argSigIdx, sigIdx});
+                    }
+                } else if (actualExpr->kind == slang::ast::ExpressionKind::NamedValue) {
+                    uint32_t sigIdx = resolveSignalIndex(
+                        actualExpr->as<slang::ast::NamedValueExpression>().symbol);
+                    if (sigIdx != UINT32_MAX)
+                        outputBindings.push_back({argSigIdx, sigIdx});
+                }
+            } else if (dir == slang::ast::ArgumentDirection::InOut) {
+                // InOut: read input value AND record for writeback
+                auto* actualExpr = actualArgs[i];
+                while (actualExpr->kind == slang::ast::ExpressionKind::Conversion)
+                    actualExpr = &actualExpr->as<slang::ast::ConversionExpression>().operand();
+                if (actualExpr->kind == slang::ast::ExpressionKind::Assignment) {
+                    auto& ae = actualExpr->as<slang::ast::AssignmentExpression>();
+                    auto& lhs = ae.left();
+                    auto initVal = el_.lower(ae.right());
+                    el_.setBlockValue(argSigIdx, initVal);
+                    if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
+                        uint32_t sigIdx = resolveSignalIndex(
+                            lhs.as<slang::ast::NamedValueExpression>().symbol);
+                        if (sigIdx != UINT32_MAX)
+                            outputBindings.push_back({argSigIdx, sigIdx});
+                    }
+                } else {
+                    auto argVal = el_.lower(*actualExpr);
+                    el_.setBlockValue(argSigIdx, argVal);
+                    if (actualExpr->kind == slang::ast::ExpressionKind::NamedValue) {
+                        uint32_t sigIdx = resolveSignalIndex(
+                            actualExpr->as<slang::ast::NamedValueExpression>().symbol);
+                        if (sigIdx != UINT32_MAX)
+                            outputBindings.push_back({argSigIdx, sigIdx});
+                    }
+                }
+            } else {
+                // Input: lower normally
+                auto argVal = el_.lower(*actualArgs[i]);
+                el_.setBlockValue(argSigIdx, argVal);
+            }
+        }
+
+        // Lower task body
+        StmtLowering bodyLower(mod_, el_, symbolMap_, /*trackBlockValues=*/true);
+        bodyLower.lower(sub->getBody());
+
+        // Write back output arguments
+        for (auto& ob : outputBindings) {
+            ExprPtr outVal;
+            auto bvIt = el_.blockValues().find(ob.formalSigIdx);
+            if (bvIt != el_.blockValues().end())
+                outVal = bvIt->second;
+            else
+                outVal = Expr::signalRef(mod_.signals[ob.formalSigIdx].width, ob.formalSigIdx);
+
+            assignments_.push_back({ob.actualSigIdx, outVal});
+            if (trackBlockValues_)
+                el_.setBlockValue(ob.actualSigIdx, outVal);
+        }
+
+        el_.restoreBlockValues(savedBlockValues);
     }
 
     uint32_t resolveSignalIndex(const slang::ast::Symbol& sym) const {

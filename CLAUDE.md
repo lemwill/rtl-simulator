@@ -2,12 +2,12 @@
 
 ## What To Do Next
 
-**Sprint 19 complete.** `inside` operator support.
+**Sprint 20 complete.** Task output arguments.
 
 Next priorities:
-1. **Task output arguments**: Support tasks with `output` port bindings.
-2. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+3. **Testbench API**: C++ API for driving inputs programmatically.
 4. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
 
 ### Project Structure
@@ -342,6 +342,10 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 ### Sprint 19: `inside` Operator (complete)
 - **`inside` operator**: `InsideExpression` lowered as chain of equality/range checks ORed together. Each `ValueRangeExpression` element becomes `(val >= lo && val <= hi)`, each scalar element becomes `(val == elem)`. Enables pattern matching in decode logic.
 - Verified cycle-accurate against Verilator: both discrete values and ranges (`[lo:hi]`) work correctly.
+
+### Sprint 20: Task Output Arguments (complete)
+- **Task output arguments**: `lowerTaskCall()` in StmtLowering handles tasks with `output` and `inout` port bindings. Detects argument direction via `ArgumentDirection`, unwraps `AssignmentExpression` wrappers on actual arguments, and writes back final block values to actual LHS after task body execution. Also handles `inout` args (read input value + write back).
+- Verified cycle-accurate against Verilator with clamp task using output port.
 
 ## Research
 
