@@ -1503,6 +1503,29 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 proc.assignments = std::move(stmtLower.assignments());
                 exprLower.clearBlockValues();
 
+                // Deduplicate: for scalar assignments, keep only the last
+                // assignment to each target (blocking semantics — later wins)
+                if (isBlocking) {
+                    std::unordered_map<uint32_t, size_t> lastScalar;
+                    for (size_t j = 0; j < proc.assignments.size(); j++) {
+                        auto& a = proc.assignments[j];
+                        if (!a.indexExpr)
+                            lastScalar[a.targetIndex] = j;
+                    }
+                    std::vector<Assignment> deduped;
+                    for (size_t j = 0; j < proc.assignments.size(); j++) {
+                        auto& a = proc.assignments[j];
+                        if (a.indexExpr) {
+                            deduped.push_back(std::move(a));
+                        } else {
+                            auto it = lastScalar.find(a.targetIndex);
+                            if (it != lastScalar.end() && it->second == j)
+                                deduped.push_back(std::move(a));
+                        }
+                    }
+                    proc.assignments = std::move(deduped);
+                }
+
                 if (proc.kind == Process::Sequential) {
                     for (auto& a : proc.assignments) {
                         if (a.indexExpr) {
