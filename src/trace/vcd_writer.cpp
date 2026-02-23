@@ -13,9 +13,14 @@ VCDWriter::~VCDWriter() {
         file_.close();
 }
 
-char VCDWriter::idChar(uint32_t index) const {
-    // VCD identifier: printable ASCII starting at '!'
-    return static_cast<char>('!' + index);
+std::string VCDWriter::idString(uint32_t index) const {
+    // Base-94 encoding using printable ASCII ('!' through '~')
+    std::string id;
+    do {
+        id += static_cast<char>('!' + (index % 94));
+        index /= 94;
+    } while (index > 0);
+    return id;
 }
 
 void VCDWriter::writeHeader(const ir::Module& mod) {
@@ -30,7 +35,7 @@ void VCDWriter::writeHeader(const ir::Module& mod) {
             file_ << "wire";
         else
             file_ << "reg";
-        file_ << " " << sig.width << " " << idChar(sig.index) << " "
+        file_ << " " << sig.width << " " << idString(sig.index) << " "
               << sig.name << " $end\n";
     }
 
@@ -41,12 +46,12 @@ void VCDWriter::writeHeader(const ir::Module& mod) {
     // Initial values (all zero)
     for (auto& sig : mod.signals) {
         if (sig.width == 1) {
-            file_ << "0" << idChar(sig.index) << "\n";
+            file_ << "0" << idString(sig.index) << "\n";
         } else {
             file_ << "b";
             for (int i = sig.width - 1; i >= 0; i--)
                 file_ << "0";
-            file_ << " " << idChar(sig.index) << "\n";
+            file_ << " " << idString(sig.index) << "\n";
         }
     }
     file_ << "$end\n";
@@ -62,12 +67,12 @@ void VCDWriter::writeTimestep(uint64_t time) {
 
 void VCDWriter::writeSignal(const ir::Signal& sig, uint64_t value) {
     if (sig.width == 1) {
-        file_ << (value & 1) << idChar(sig.index) << "\n";
+        file_ << (value & 1) << idString(sig.index) << "\n";
     } else {
         file_ << "b";
         for (int i = sig.width - 1; i >= 0; i--)
             file_ << ((value >> i) & 1);
-        file_ << " " << idChar(sig.index) << "\n";
+        file_ << " " << idString(sig.index) << "\n";
     }
 }
 

@@ -184,6 +184,39 @@ private:
                 return result;
             }
 
+            case ir::ExprKind::ArrayElement: {
+                auto* indexVal = emitExpr(expr->operands[0], stateBase);
+                uint32_t baseIdx = expr->arrayBaseIndex;
+                uint32_t arrSize = expr->arraySize;
+                uint32_t elemWidth = expr->elementWidth;
+                uint32_t elemBytes = ir::bytesForWidth(elemWidth);
+
+                // Clamp index to [0, arrSize-1]
+                auto* i32Ty = llvm::Type::getInt32Ty(ctx_);
+                auto* idx32 = builder_.CreateZExtOrTrunc(indexVal, i32Ty);
+                auto* maxIdx = llvm::ConstantInt::get(i32Ty, arrSize - 1);
+                auto* oob = builder_.CreateICmpUGT(idx32, maxIdx);
+                auto* clampedIdx = builder_.CreateSelect(oob, maxIdx, idx32);
+
+                // Compute byte offset: baseOffset + clampedIdx * elemBytes
+                uint32_t baseOffset = mod_.signals[baseIdx].stateOffset;
+                auto* baseConst = llvm::ConstantInt::get(i32Ty, baseOffset);
+                auto* elemBytesConst = llvm::ConstantInt::get(i32Ty, elemBytes);
+                auto* offsetFromBase = builder_.CreateMul(clampedIdx, elemBytesConst);
+                auto* totalOffset = builder_.CreateAdd(baseConst, offsetFromBase);
+
+                // GEP into state with computed offset
+                auto* ptr = builder_.CreateGEP(
+                    llvm::Type::getInt8Ty(ctx_), stateBase, totalOffset);
+
+                // Load and truncate
+                auto* storeTy = intTy(elemBytes * 8);
+                llvm::Value* val = builder_.CreateLoad(storeTy, ptr, "arr_elem");
+                if (elemBytes * 8 > elemWidth)
+                    val = builder_.CreateTrunc(val, intTy(elemWidth));
+                return val;
+            }
+
             default:
                 return llvm::ConstantInt::get(intTy(expr->width), 0);
         }

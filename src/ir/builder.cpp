@@ -13,6 +13,7 @@
 #include <slang/ast/expressions/Operator.h>
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
+#include <slang/ast/statements/LoopStatements.h>
 #include <slang/ast/statements/MiscStatements.h>
 #include <slang/ast/symbols/BlockSymbols.h>
 #include <slang/ast/symbols/InstanceSymbols.h>
@@ -51,11 +52,44 @@ std::optional<uint64_t> extractConstantInt(const slang::ast::Expression& expr) {
     return std::nullopt;
 }
 
+// ── Array metadata ──────────────────────────────────────────────────────────
+
+struct ArrayInfo {
+    uint32_t baseSignalIndex; // signal index of element [0]
+    uint32_t size;            // number of elements
+    uint32_t elementWidth;    // bit width per element
+    int32_t  rangeLower;      // lower bound of the range (e.g., 0 for [0:7])
+};
+
+using ArrayMap = std::unordered_map<const slang::ast::Symbol*, ArrayInfo>;
+
+// Check if a type is a fixed-size unpacked array.
+std::optional<std::tuple<uint32_t, uint32_t, int32_t>>
+getUnpackedArrayInfo(const slang::ast::Type& type) {
+    auto& canon = type.getCanonicalType();
+    if (canon.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+        auto& arrTy = canon.as<slang::ast::FixedSizeUnpackedArrayType>();
+        uint32_t elemWidth = getTypeWidth(arrTy.elementType);
+        uint32_t size = static_cast<uint32_t>(arrTy.range.fullWidth());
+        int32_t lower = arrTy.range.lower();
+        return std::make_tuple(elemWidth, size, lower);
+    }
+    return std::nullopt;
+}
+
 // ── Expression lowering ─────────────────────────────────────────────────────
 
 class ExprLowering {
 public:
-    explicit ExprLowering(Module& mod) : mod_(mod) {}
+    ExprLowering(Module& mod, const ArrayMap& arrayMap)
+        : mod_(mod), arrayMap_(arrayMap) {}
+
+    void setLoopVarValue(const slang::ast::Symbol* sym, uint64_t val) {
+        loopVarValues_[sym] = val;
+    }
+    void clearLoopVarValue(const slang::ast::Symbol* sym) {
+        loopVarValues_.erase(sym);
+    }
 
     ExprPtr lower(const slang::ast::Expression& expr) {
         switch (expr.kind) {
@@ -84,8 +118,12 @@ public:
         }
     }
 
+    const ArrayMap& arrayMap() const { return arrayMap_; }
+
 private:
     Module& mod_;
+    const ArrayMap& arrayMap_;
+    std::unordered_map<const slang::ast::Symbol*, uint64_t> loopVarValues_;
 
     ExprPtr lowerIntLiteral(const slang::ast::IntegerLiteral& lit) {
         auto val = lit.getValue();
@@ -98,6 +136,12 @@ private:
     ExprPtr lowerNamedValue(const slang::ast::NamedValueExpression& nv) {
         auto& sym = nv.symbol;
 
+        // Check if this is a loop variable with a known constant value
+        auto lvIt = loopVarValues_.find(&sym);
+        if (lvIt != loopVarValues_.end()) {
+            return Expr::constant(getTypeWidth(*nv.type), lvIt->second);
+        }
+
         // Handle parameters/localparams as constants
         if (sym.kind == slang::ast::SymbolKind::Parameter) {
             auto& param = sym.as<slang::ast::ParameterSymbol>();
@@ -108,6 +152,13 @@ private:
                     v = *opt;
             }
             return Expr::constant(getTypeWidth(*nv.type), v);
+        }
+
+        // Check if this is an array (whole-array reference — unsupported as expr)
+        auto arrIt = arrayMap_.find(&sym);
+        if (arrIt != arrayMap_.end()) {
+            std::cerr << "surge: unsupported whole-array reference '" << sym.name << "'\n";
+            return Expr::constant(1, 0);
         }
 
         auto* sig = mod_.findSignal(std::string(sym.name));
@@ -217,6 +268,13 @@ private:
     }
 
     ExprPtr lowerElementSelect(const slang::ast::ElementSelectExpression& es) {
+        // Check if this is an unpacked array element access
+        auto& baseType = es.value().type->getCanonicalType();
+        if (baseType.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+            return lowerUnpackedArraySelect(es);
+        }
+
+        // Packed bit select
         auto src = lower(es.value());
         auto idx = extractConstantInt(es.selector());
         if (idx) {
@@ -228,6 +286,49 @@ private:
         uint32_t srcWidth = getTypeWidth(*es.value().type);
         auto shifted = Expr::binary(BinaryOp::Shr, srcWidth, src, selExpr);
         return Expr::binary(BinaryOp::And, 1, shifted, Expr::constant(srcWidth, 1));
+    }
+
+    ExprPtr lowerUnpackedArraySelect(const slang::ast::ElementSelectExpression& es) {
+        // Get the array base symbol
+        const slang::ast::Symbol* baseSym = nullptr;
+        if (es.value().kind == slang::ast::ExpressionKind::NamedValue) {
+            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
+        }
+
+        if (!baseSym) {
+            std::cerr << "surge: unsupported unpacked array base expression\n";
+            return Expr::constant(getTypeWidth(*es.type), 0);
+        }
+
+        auto arrIt = arrayMap_.find(baseSym);
+        if (arrIt == arrayMap_.end()) {
+            std::cerr << "surge: array info not found for '" << baseSym->name << "'\n";
+            return Expr::constant(getTypeWidth(*es.type), 0);
+        }
+
+        auto& info = arrIt->second;
+
+        // Check for constant index
+        auto constIdx = extractConstantInt(es.selector());
+        if (constIdx) {
+            int64_t idx = static_cast<int64_t>(*constIdx) - info.rangeLower;
+            if (idx < 0 || static_cast<uint32_t>(idx) >= info.size) {
+                std::cerr << "surge: array index out of bounds: " << *constIdx << "\n";
+                return Expr::constant(info.elementWidth, 0);
+            }
+            uint32_t sigIdx = info.baseSignalIndex + static_cast<uint32_t>(idx);
+            return Expr::signalRef(info.elementWidth, sigIdx);
+        }
+
+        // Dynamic index: emit ArrayElement expression
+        auto indexExpr = lower(es.selector());
+        // Subtract range lower bound if non-zero
+        if (info.rangeLower != 0) {
+            indexExpr = Expr::binary(BinaryOp::Sub, indexExpr->width, indexExpr,
+                Expr::constant(indexExpr->width, static_cast<uint64_t>(
+                    static_cast<int64_t>(info.rangeLower))));
+        }
+        return Expr::arrayElement(info.elementWidth, info.baseSignalIndex, info.size, indexExpr);
     }
 
     ExprPtr lowerRangeSelect(const slang::ast::RangeSelectExpression& rs) {
@@ -261,6 +362,102 @@ private:
     }
 };
 
+// ── For-loop helpers ────────────────────────────────────────────────────────
+
+// Unwrap NamedValue from possible Conversion wrappers.
+const slang::ast::Symbol* unwrapNamedSymbol(const slang::ast::Expression& expr) {
+    if (expr.kind == slang::ast::ExpressionKind::NamedValue)
+        return &expr.as<slang::ast::NamedValueExpression>().symbol;
+    if (expr.kind == slang::ast::ExpressionKind::Conversion)
+        return unwrapNamedSymbol(expr.as<slang::ast::ConversionExpression>().operand());
+    return nullptr;
+}
+
+int64_t detectStepIncrement(const slang::ast::Expression& stepExpr,
+                            const slang::ast::Symbol* loopVar) {
+    if (stepExpr.kind == slang::ast::ExpressionKind::Assignment) {
+        auto& assign = stepExpr.as<slang::ast::AssignmentExpression>();
+        // Compound assignment: i += N or i -= N
+        if (assign.isCompound()) {
+            auto val = extractConstantInt(assign.right());
+            if (assign.op.value() == slang::ast::BinaryOperator::Add)
+                return val ? static_cast<int64_t>(*val) : 1;
+            if (assign.op.value() == slang::ast::BinaryOperator::Subtract)
+                return val ? -static_cast<int64_t>(*val) : -1;
+        }
+        // i = i + N pattern
+        if (assign.right().kind == slang::ast::ExpressionKind::BinaryOp) {
+            auto& bin = assign.right().as<slang::ast::BinaryExpression>();
+            if (bin.op == slang::ast::BinaryOperator::Add) {
+                auto rval = extractConstantInt(bin.right());
+                if (rval) return static_cast<int64_t>(*rval);
+                auto lval = extractConstantInt(bin.left());
+                if (lval) return static_cast<int64_t>(*lval);
+            }
+            if (bin.op == slang::ast::BinaryOperator::Subtract) {
+                auto rval = extractConstantInt(bin.right());
+                if (rval) return -static_cast<int64_t>(*rval);
+            }
+        }
+    }
+    // Check if wrapped in conversion
+    if (stepExpr.kind == slang::ast::ExpressionKind::Conversion) {
+        return detectStepIncrement(
+            stepExpr.as<slang::ast::ConversionExpression>().operand(), loopVar);
+    }
+    return 1; // default
+}
+
+bool evaluateStopCondition(const slang::ast::Expression& stopExpr,
+                           const slang::ast::Symbol* loopVar,
+                           uint64_t currentVal) {
+    if (stopExpr.kind == slang::ast::ExpressionKind::BinaryOp) {
+        auto& bin = stopExpr.as<slang::ast::BinaryExpression>();
+        uint64_t bound = 0;
+        bool varOnLeft = false;
+
+        auto* leftSym = unwrapNamedSymbol(bin.left());
+        auto* rightSym = unwrapNamedSymbol(bin.right());
+
+        if (leftSym == loopVar) {
+            varOnLeft = true;
+            auto val = extractConstantInt(bin.right());
+            if (!val) return false;
+            bound = *val;
+        } else if (rightSym == loopVar) {
+            auto val = extractConstantInt(bin.left());
+            if (!val) return false;
+            bound = *val;
+        } else {
+            return false;
+        }
+
+        int64_t sv = static_cast<int64_t>(currentVal);
+        int64_t sb = static_cast<int64_t>(bound);
+
+        switch (bin.op) {
+            case slang::ast::BinaryOperator::LessThan:
+                return varOnLeft ? (sv < sb) : (sb < sv);
+            case slang::ast::BinaryOperator::LessThanEqual:
+                return varOnLeft ? (sv <= sb) : (sb <= sv);
+            case slang::ast::BinaryOperator::GreaterThan:
+                return varOnLeft ? (sv > sb) : (sb > sv);
+            case slang::ast::BinaryOperator::GreaterThanEqual:
+                return varOnLeft ? (sv >= sb) : (sb >= sv);
+            case slang::ast::BinaryOperator::Inequality:
+                return currentVal != bound;
+            case slang::ast::BinaryOperator::Equality:
+                return currentVal == bound;
+            default: break;
+        }
+    }
+    if (stopExpr.kind == slang::ast::ExpressionKind::Conversion) {
+        return evaluateStopCondition(
+            stopExpr.as<slang::ast::ConversionExpression>().operand(), loopVar, currentVal);
+    }
+    return false;
+}
+
 // ── Statement lowering (builds assignments) ─────────────────────────────────
 
 class StmtLowering {
@@ -288,6 +485,12 @@ public:
             case slang::ast::StatementKind::Case:
                 lowerCase(stmt.as<slang::ast::CaseStatement>());
                 break;
+            case slang::ast::StatementKind::ForLoop:
+                lowerForLoop(stmt.as<slang::ast::ForLoopStatement>());
+                break;
+            case slang::ast::StatementKind::VariableDeclaration:
+                // Skip variable declarations (e.g., loop variable `int i`)
+                break;
             default:
                 std::cerr << "surge: unsupported statement kind "
                           << static_cast<int>(stmt.kind) << "\n";
@@ -312,18 +515,148 @@ private:
 
     void lowerAssignment(const slang::ast::AssignmentExpression& ae) {
         auto& lhs = ae.left();
-        if (lhs.kind != slang::ast::ExpressionKind::NamedValue) {
-            std::cerr << "surge: unsupported LHS in assignment\n";
-            return;
-        }
-        auto& nv = lhs.as<slang::ast::NamedValueExpression>();
-        auto* sig = mod_.findSignal(std::string(nv.symbol.name));
-        if (!sig) {
-            std::cerr << "surge: unknown target signal '" << nv.symbol.name << "'\n";
-            return;
-        }
         auto rhs = el_.lower(ae.right());
-        assignments_.push_back({sig->index, rhs});
+
+        if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
+            auto& nv = lhs.as<slang::ast::NamedValueExpression>();
+            auto* sig = mod_.findSignal(std::string(nv.symbol.name));
+            if (!sig) {
+                std::cerr << "surge: unknown target signal '" << nv.symbol.name << "'\n";
+                return;
+            }
+            assignments_.push_back({sig->index, rhs});
+        } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
+            lowerIndexedAssignment(lhs.as<slang::ast::ElementSelectExpression>(), rhs);
+        } else {
+            std::cerr << "surge: unsupported LHS kind "
+                      << static_cast<int>(lhs.kind) << " in assignment\n";
+        }
+    }
+
+    void lowerIndexedAssignment(const slang::ast::ElementSelectExpression& es, ExprPtr rhs) {
+        // Get array base symbol
+        const slang::ast::Symbol* baseSym = nullptr;
+        if (es.value().kind == slang::ast::ExpressionKind::NamedValue) {
+            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
+        }
+
+        if (!baseSym) {
+            std::cerr << "surge: unsupported indexed LHS base\n";
+            return;
+        }
+
+        auto& arrayMap = el_.arrayMap();
+        auto arrIt = arrayMap.find(baseSym);
+        if (arrIt == arrayMap.end()) {
+            std::cerr << "surge: packed bit assignment not yet supported\n";
+            return;
+        }
+
+        auto& info = arrIt->second;
+
+        // Check for constant index
+        auto constIdx = extractConstantInt(es.selector());
+        if (constIdx) {
+            int64_t idx = static_cast<int64_t>(*constIdx) - info.rangeLower;
+            if (idx < 0 || static_cast<uint32_t>(idx) >= info.size) {
+                std::cerr << "surge: array assignment index out of bounds\n";
+                return;
+            }
+            uint32_t sigIdx = info.baseSignalIndex + static_cast<uint32_t>(idx);
+            assignments_.push_back({sigIdx, rhs});
+            return;
+        }
+
+        // Try lowering the selector — it may resolve to a constant (e.g., loop variable)
+        auto selExpr = el_.lower(es.selector());
+        // Subtract range lower bound if non-zero
+        if (info.rangeLower != 0) {
+            selExpr = Expr::binary(BinaryOp::Sub, selExpr->width, selExpr,
+                Expr::constant(selExpr->width, static_cast<uint64_t>(
+                    static_cast<int64_t>(info.rangeLower))));
+        }
+
+        // Check if selector resolved to a constant after lowering
+        if (selExpr->kind == ExprKind::Constant) {
+            uint32_t idx = static_cast<uint32_t>(selExpr->constVal);
+            if (idx < info.size) {
+                assignments_.push_back({info.baseSignalIndex + idx, rhs});
+            } else {
+                std::cerr << "surge: array assignment index out of bounds (resolved constant)\n";
+            }
+            return;
+        }
+
+        // Dynamic index: assign to ALL elements, each guarded by a mux
+        // regfile[sel] = rhs  -->  for each i: regfile[i] = (sel == i) ? rhs : regfile[i]
+        for (uint32_t i = 0; i < info.size; i++) {
+            uint32_t sigIdx = info.baseSignalIndex + i;
+            auto cond = Expr::binary(BinaryOp::Eq, 1, selExpr,
+                                     Expr::constant(selExpr->width, i));
+            auto currentVal = Expr::signalRef(info.elementWidth, sigIdx);
+            auto muxed = Expr::mux(info.elementWidth, cond, rhs, currentVal);
+            assignments_.push_back({sigIdx, muxed});
+        }
+    }
+
+    void lowerForLoop(const slang::ast::ForLoopStatement& fl) {
+        const slang::ast::Symbol* loopVar = nullptr;
+        uint64_t currentVal = 0;
+
+        // Extract loop variable and initial value
+        if (!fl.loopVars.empty()) {
+            loopVar = fl.loopVars[0];
+            if (loopVar->kind == slang::ast::SymbolKind::Variable) {
+                if (auto* init = loopVar->as<slang::ast::VariableSymbol>().getInitializer()) {
+                    auto val = extractConstantInt(*init);
+                    if (val) currentVal = *val;
+                }
+            }
+        } else if (!fl.initializers.empty()) {
+            auto& initExpr = *fl.initializers[0];
+            // Unwrap possible conversion
+            const slang::ast::Expression* inner = &initExpr;
+            if (inner->kind == slang::ast::ExpressionKind::Conversion)
+                inner = &inner->as<slang::ast::ConversionExpression>().operand();
+            if (inner->kind == slang::ast::ExpressionKind::Assignment) {
+                auto& assign = inner->as<slang::ast::AssignmentExpression>();
+                auto* sym = unwrapNamedSymbol(assign.left());
+                if (sym) loopVar = sym;
+                auto val = extractConstantInt(assign.right());
+                if (val) currentVal = *val;
+            }
+        }
+
+        if (!loopVar) {
+            std::cerr << "surge: for loop has no identifiable loop variable\n";
+            return;
+        }
+
+        // Determine step increment
+        int64_t stepIncrement = 1;
+        if (!fl.steps.empty()) {
+            stepIncrement = detectStepIncrement(*fl.steps[0], loopVar);
+        }
+
+        // Unroll loop (compile-time constant bounds only)
+        const uint32_t MAX_UNROLL = 1024;
+        uint32_t iter;
+        for (iter = 0; iter < MAX_UNROLL; iter++) {
+            if (fl.stopExpr) {
+                if (!evaluateStopCondition(*fl.stopExpr, loopVar, currentVal))
+                    break;
+            }
+
+            el_.setLoopVarValue(loopVar, currentVal);
+            lower(fl.body);
+
+            currentVal = static_cast<uint64_t>(static_cast<int64_t>(currentVal) + stepIncrement);
+        }
+
+        el_.clearLoopVarValue(loopVar);
+
+        if (iter == MAX_UNROLL)
+            std::cerr << "surge: for loop unroll limit reached (" << MAX_UNROLL << ")\n";
     }
 
     void lowerConditional(const slang::ast::ConditionalStatement& cs) {
@@ -484,6 +817,9 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
     mod->name = std::string(topInst->name);
     auto& body = topInst->body;
 
+    // Array metadata map
+    ArrayMap arrayMap;
+
     // ── Pass 1: collect signals ─────────────────────────────────────────────
 
     for (auto& member : body.members()) {
@@ -505,22 +841,44 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
         if (member.kind == slang::ast::SymbolKind::Variable) {
             auto& var = member.as<slang::ast::VariableSymbol>();
             if (!mod->findSignal(std::string(var.name))) {
-                uint32_t w = getTypeWidth(var.getType());
-                mod->addSignal(std::string(var.name), w, SignalKind::Internal);
+                auto arrInfo = getUnpackedArrayInfo(var.getType());
+                if (arrInfo) {
+                    auto [elemWidth, arrSize, rangeLower] = *arrInfo;
+                    uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
+                    for (uint32_t i = 0; i < arrSize; i++) {
+                        std::string elemName = std::string(var.name) + "[" + std::to_string(i) + "]";
+                        mod->addSignal(elemName, elemWidth, SignalKind::Internal);
+                    }
+                    arrayMap[&var] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
+                } else {
+                    uint32_t w = getTypeWidth(var.getType());
+                    mod->addSignal(std::string(var.name), w, SignalKind::Internal);
+                }
             }
         }
         if (member.kind == slang::ast::SymbolKind::Net) {
             auto& net = member.as<slang::ast::NetSymbol>();
             if (!mod->findSignal(std::string(net.name))) {
-                uint32_t w = getTypeWidth(net.getType());
-                mod->addSignal(std::string(net.name), w, SignalKind::Internal);
+                auto arrInfo = getUnpackedArrayInfo(net.getType());
+                if (arrInfo) {
+                    auto [elemWidth, arrSize, rangeLower] = *arrInfo;
+                    uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
+                    for (uint32_t i = 0; i < arrSize; i++) {
+                        std::string elemName = std::string(net.name) + "[" + std::to_string(i) + "]";
+                        mod->addSignal(elemName, elemWidth, SignalKind::Internal);
+                    }
+                    arrayMap[&net] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
+                } else {
+                    uint32_t w = getTypeWidth(net.getType());
+                    mod->addSignal(std::string(net.name), w, SignalKind::Internal);
+                }
             }
         }
     }
 
     // ── Pass 2: lower processes ─────────────────────────────────────────────
 
-    ExprLowering exprLower(*mod);
+    ExprLowering exprLower(*mod, arrayMap);
 
     for (auto& member : body.members()) {
         if (member.kind == slang::ast::SymbolKind::ProceduralBlock) {
@@ -586,6 +944,28 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
                             }
                         }
                         bitPos += tWidth;
+                    }
+                } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
+                    // Continuous assignment with indexed LHS (e.g., assign arr[0] = ...)
+                    auto& es = lhs.as<slang::ast::ElementSelectExpression>();
+                    auto rhs = exprLower.lower(ae.right());
+                    const slang::ast::Symbol* baseSym = nullptr;
+                    if (es.value().kind == slang::ast::ExpressionKind::NamedValue)
+                        baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
+                    if (baseSym) {
+                        auto arrIt = arrayMap.find(baseSym);
+                        if (arrIt != arrayMap.end()) {
+                            auto& info = arrIt->second;
+                            auto constIdx = extractConstantInt(es.selector());
+                            if (constIdx) {
+                                uint32_t idx = static_cast<uint32_t>(*constIdx)
+                                    - static_cast<uint32_t>(info.rangeLower);
+                                if (idx < info.size) {
+                                    proc.assignments.push_back(
+                                        {info.baseSignalIndex + idx, rhs});
+                                }
+                            }
+                        }
                     }
                 }
             }

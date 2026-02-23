@@ -20,7 +20,7 @@ private:
     bool headerWritten_ = false;
     uint64_t lastTime_ = ~0ULL;
 
-    char idChar(uint32_t index) const;
+    std::string idString(uint32_t index) const;
 };
 
 } // namespace surge::trace

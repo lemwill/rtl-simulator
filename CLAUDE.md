@@ -2,12 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 2 complete.** 2.6x faster than Verilator on LFSR benchmark with correct results.
+**Sprint 3 complete.** Unpacked arrays, for loops, 32-bit ALU+regfile benchmark.
 
 Next priorities:
-1. Expand SV coverage: for loops, memories/arrays, multi-module hierarchy, wider bitwidths
-2. More complex benchmark designs (FSM with driven inputs, pipelined datapath)
-3. Testbench input driving (currently only clock/reset are driven automatically)
+1. **Performance**: ALU+regfile is slower than Verilator (18.7 vs 33 MHz). Key bottleneck: mux-guarded dynamic writes generate 8 selects per register write. Need computed store optimization or LLVM-level array lowering.
+2. **Testbench input driving**: Currently only clock/reset driven. Need stimulus mechanism to exercise ALU operations.
+3. **Multi-module hierarchy**: Module instantiation and port binding.
+4. **Generate blocks**: Parameterized module generation.
 
 ### Project Structure
 ```
@@ -34,6 +35,7 @@ surge/
     adder.sv
     lfsr.sv
     fsm.sv
+    alu_regfile.sv
   bench/
     run_bench.sh            # Surge vs Verilator benchmark
 ```
@@ -113,6 +115,20 @@ Once the full pipeline is working, include performance metrics vs verilator.
 | Surge (O2) | **101 MHz** | lfsr_out=0xf4 |
 | Verilator 5.045 (-O2) | 39 MHz | lfsr_out=0xf4 |
 | **Speedup** | **2.6x** | PASS |
+
+### Sprint 3: Unpacked Arrays, For Loops, ALU+Regfile (complete)
+- Added: unpacked array declarations (flattened to N signals), for-loop unrolling (compile-time), dynamic array read (ArrayElement IR + computed GEP), dynamic array write (mux-guarded N assignments)
+- VCD multi-character identifiers (base-94 encoding, supports >8000 signals)
+- Bug fix: loop variable constant propagation into indexed assignments
+- Code quality: signed arithmetic for array range offsets, loop unroll limit warning, loop var type safety
+
+**Performance (10M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **100 MHz** | 39 MHz | **2.6x** | PASS |
+| ALU+8x32 Regfile | 18.7 MHz | **33 MHz** | 0.58x | PASS |
+
+ALU regression: mux-guarded dynamic writes are 8x per register write. Needs computed store optimization.
 
 ## Research
 

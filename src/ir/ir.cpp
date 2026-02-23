@@ -67,6 +67,17 @@ ExprPtr Expr::concat(uint32_t w, std::vector<ExprPtr> parts) {
     return e;
 }
 
+ExprPtr Expr::arrayElement(uint32_t elemWidth, uint32_t baseIdx, uint32_t size, ExprPtr indexExpr) {
+    auto e = std::make_shared<Expr>();
+    e->kind           = ExprKind::ArrayElement;
+    e->width          = elemWidth;
+    e->arrayBaseIndex = baseIdx;
+    e->arraySize      = size;
+    e->elementWidth   = elemWidth;
+    e->operands.push_back(std::move(indexExpr));
+    return e;
+}
+
 // ── Module ──────────────────────────────────────────────────────────────────
 
 uint32_t Module::addSignal(const std::string& n, uint32_t w, SignalKind k) {

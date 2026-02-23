@@ -26,9 +26,10 @@ enum class ExprKind {
     SignalRef,
     UnaryOp,
     BinaryOp,
-    Mux,       // ternary select: cond ? t : f
-    Slice,     // bit extract [hi:lo]
+    Mux,          // ternary select: cond ? t : f
+    Slice,        // bit extract [hi:lo]
     Concat,
+    ArrayElement, // dynamic unpacked array element access
 };
 
 enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor };
@@ -53,6 +54,9 @@ struct Expr {
     BinaryOp binaryOp       = BinaryOp::Add;
     uint32_t sliceHi        = 0;
     uint32_t sliceLo        = 0;
+    uint32_t arrayBaseIndex = 0; // ArrayElement: signal index of element [0]
+    uint32_t arraySize      = 0; // ArrayElement: number of elements
+    uint32_t elementWidth   = 0; // ArrayElement: bit width per element
     std::vector<ExprPtr> operands;
 
     // ── factories ──
@@ -63,6 +67,7 @@ struct Expr {
     static ExprPtr mux(uint32_t w, ExprPtr cond, ExprPtr t, ExprPtr f);
     static ExprPtr slice(uint32_t w, ExprPtr src, uint32_t hi, uint32_t lo);
     static ExprPtr concat(uint32_t w, std::vector<ExprPtr> parts);
+    static ExprPtr arrayElement(uint32_t elemWidth, uint32_t baseIdx, uint32_t size, ExprPtr indexExpr);
 };
 
 // ── Processes ───────────────────────────────────────────────────────────────
