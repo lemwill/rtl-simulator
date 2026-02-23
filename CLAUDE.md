@@ -2,7 +2,7 @@
 
 ## What To Do Next
 
-**Sprint 16 complete.** User-defined function inlining, foreach loops, system task silencing, break/continue, return statements.
+**Sprint 17 complete.** Assignment patterns, initial blocks, always_latch.
 
 Next priorities:
 1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
@@ -46,6 +46,7 @@ surge/
     spi_master.sv
     struct_test.sv
     func_test.sv
+    initial_test.sv
     param_adder.sv
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
@@ -325,6 +326,12 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 - **System task silencing**: `$display`, `$write`, `$strobe`, `$monitor`, `$finish`, `$stop`, `$info`, `$warning`, `$error`, `$fatal`, `$time`, `$realtime` silently ignored (no-op in synthesis-oriented sim). Also handles `CallExpression` in `ExpressionStatement`.
 - **Bugfix: one-armed if with block values**: When `trackBlockValues_` is true and there's no else-branch, the false path now uses the pre-branch block value instead of `SignalRef(target)`. Fixes for-loop accumulation with conditional increment (e.g., popcount).
 - New test: `func_test.sv` — functions with conditional return, for-loop accumulation (popcount), foreach array init, arithmetic functions. Verified cycle-accurate against Verilator.
+
+### Sprint 17: Assignment Patterns, Initial Blocks (complete)
+- **Assignment patterns**: `SimpleAssignmentPattern`, `StructuredAssignmentPattern`, `ReplicatedAssignmentPattern` expressions lowered. Packed types → concatenation of elements. Unpacked types → constant eval fallback.
+- **Initial blocks**: `ProceduralBlockKind::Initial` blocks lowered separately from always blocks. Constant-valued assignments extracted and stored as `Module::initialValues`. Runtime applies initial values to state buffer before simulation starts.
+- **always_latch**: Treated as combinational (same as always_comb).
+- New test: `initial_test.sv` — initial block sets scalar and array element values, combined with counter. Verified cycle-accurate against Verilator.
 
 ## Research
 

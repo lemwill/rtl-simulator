@@ -147,6 +147,10 @@ public:
                 return lowerCall(expr.as<slang::ast::CallExpression>());
             case slang::ast::ExpressionKind::MemberAccess:
                 return lowerMemberAccess(expr.as<slang::ast::MemberAccessExpression>());
+            case slang::ast::ExpressionKind::SimpleAssignmentPattern:
+            case slang::ast::ExpressionKind::StructuredAssignmentPattern:
+            case slang::ast::ExpressionKind::ReplicatedAssignmentPattern:
+                return lowerAssignmentPattern(expr);
             default:
                 std::cerr << "surge: unsupported expression kind "
                           << static_cast<int>(expr.kind) << "\n";
@@ -464,6 +468,46 @@ private:
         std::cerr << "surge: unsupported member access on '"
                   << ma.member.name << "'\n";
         return Expr::constant(fieldWidth, 0);
+    }
+
+    ExprPtr lowerAssignmentPattern(const slang::ast::Expression& expr) {
+        // Assignment patterns: '{a, b, c}, '{default: 0}, '{N{val}}
+        // For packed types, slang pre-expands elements() into a flat list matching the type.
+        // We treat it as a concatenation of all elements (MSB-first).
+        auto& base = static_cast<const slang::ast::AssignmentPatternExpressionBase&>(expr);
+        auto elems = base.elements();
+        uint32_t totalWidth = getTypeWidth(*expr.type);
+
+        if (elems.empty())
+            return Expr::constant(totalWidth, 0);
+
+        // Check if this is for a packed type (concatenation) vs unpacked (per-element)
+        auto& canon = expr.type->getCanonicalType();
+        bool isPacked = (canon.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType);
+
+        if (isPacked) {
+            // Packed: concatenate elements MSB-first
+            std::vector<ExprPtr> parts;
+            for (auto* e : elems)
+                parts.push_back(lower(*e));
+            return Expr::concat(totalWidth, std::move(parts));
+        }
+
+        // Unpacked array: try constant evaluation (common for '{default: 0})
+        if (auto* cv = expr.getConstant()) {
+            if (cv->isInteger()) {
+                uint64_t v = 0;
+                if (auto opt = cv->integer().as<uint64_t>())
+                    v = *opt;
+                return Expr::constant(totalWidth, v);
+            }
+        }
+
+        // Fall back: lower each element and concatenate
+        std::vector<ExprPtr> parts;
+        for (auto* e : elems)
+            parts.push_back(lower(*e));
+        return Expr::concat(totalWidth, std::move(parts));
     }
 
     ExprPtr lowerElementSelect(const slang::ast::ElementSelectExpression& es) {
@@ -1729,6 +1773,11 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 auto& pb = member.as<slang::ast::ProceduralBlockSymbol>();
                 Process proc;
 
+                // Skip initial/final blocks — handled separately below
+                if (pb.procedureKind == slang::ast::ProceduralBlockKind::Initial ||
+                    pb.procedureKind == slang::ast::ProceduralBlockKind::Final)
+                    continue;
+
                 if (pb.procedureKind == slang::ast::ProceduralBlockKind::AlwaysFF) {
                     proc.kind = Process::Sequential;
                     // Find the clock signal for this scope
@@ -1739,6 +1788,7 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                         proc.clockEdge = EdgeKind::Posedge;
                     }
                 } else {
+                    // always_comb, always_latch, always @(*) — all combinational
                     proc.kind = Process::Combinational;
                 }
 
@@ -1864,6 +1914,28 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 if (!proc.assignments.empty())
                     mod->processes.push_back(std::move(proc));
             }
+        }
+
+        // ── Initial blocks: extract constant initial values ──────────────
+        for (auto* memberPtr : allMembers) {
+            auto& member = *memberPtr;
+            if (member.kind != slang::ast::SymbolKind::ProceduralBlock) continue;
+            auto& pb = member.as<slang::ast::ProceduralBlockSymbol>();
+            if (pb.procedureKind != slang::ast::ProceduralBlockKind::Initial) continue;
+
+            // Lower the initial block body with blocking semantics
+            exprLower.clearBlockValues();
+            StmtLowering initLower(*mod, exprLower, symbolMap, true);
+            initLower.lower(pb.getBody());
+
+            // Extract constant-valued assignments as initialValues
+            for (auto& a : initLower.assignments()) {
+                if (a.indexExpr) continue; // skip dynamic array stores
+                if (a.value && a.value->kind == ExprKind::Constant) {
+                    mod->initialValues.push_back({a.targetIndex, a.value->constVal});
+                }
+            }
+            exprLower.clearBlockValues();
         }
     };
 

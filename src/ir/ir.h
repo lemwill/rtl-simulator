@@ -103,6 +103,9 @@ struct Module {
     std::vector<Signal> signals;
     std::vector<Process> processes;
 
+    // Initial values: signal index → constant value (from initial blocks)
+    std::vector<std::pair<uint32_t, uint64_t>> initialValues;
+
     uint32_t stateSize = 0; // total bytes, set by computeLayout()
 
     uint32_t addSignal(const std::string& n, uint32_t w, SignalKind k);
