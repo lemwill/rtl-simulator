@@ -14,7 +14,10 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <algorithm>
 #include <iostream>
+#include <queue>
+#include <unordered_map>
 
 namespace surge::codegen {
 
@@ -50,40 +53,16 @@ public:
         : mod_(mod), ctx_(ctx), llvmMod_(llvmMod), builder_(ctx) {}
 
     void generate() {
-        // Create function: void eval(i8* state, i8* next_state)
-        auto* i8PtrTy = llvm::PointerType::getUnqual(ctx_);
-        auto* voidTy  = llvm::Type::getVoidTy(ctx_);
-        auto* fnTy    = llvm::FunctionType::get(voidTy, {i8PtrTy, i8PtrTy}, false);
-        evalFn_ = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
-                                          "eval", llvmMod_);
-        auto* state     = evalFn_->getArg(0);
-        auto* nextState = evalFn_->getArg(1);
-        state->setName("state");
-        nextState->setName("next_state");
+        // Compile-time analysis (done once, reused by both functions)
+        analyzeProcesses();
+        sortedCombAssigns_ = topoSortCombAssigns();
+        ffRegions_ = computeFFRegions();
 
-        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", evalFn_);
-        builder_.SetInsertPoint(entry);
+        // Generate single-cycle eval function (used for VCD tracing mode)
+        generateEval();
 
-        // Generate code for each process
-        for (auto& proc : mod_.processes) {
-            for (auto& assign : proc.assignments) {
-                auto* val = emitExpr(assign.value, state);
-
-                // Sequential assigns write to next_state, combinational to state
-                auto* storeBase = (proc.kind == ir::Process::Sequential) ? nextState : state;
-
-                if (assign.indexExpr) {
-                    // Computed array store
-                    emitArrayStore(storeBase, state, assign, val);
-                } else {
-                    // Scalar store
-                    auto& sig = mod_.signals[assign.targetIndex];
-                    storeSignal(storeBase, sig, val);
-                }
-            }
-        }
-
-        builder_.CreateRetVoid();
+        // Generate JIT loop function (fast path: eval + commitFFs in a loop)
+        generateSimulate();
     }
 
 private:
@@ -91,7 +70,233 @@ private:
     llvm::LLVMContext& ctx_;
     llvm::Module& llvmMod_;
     llvm::IRBuilder<> builder_;
-    llvm::Function* evalFn_ = nullptr;
+
+    // SSA signal promotion (compile-time analysis, reused by both functions)
+    std::vector<bool> combWritten_;
+    struct CombAssign { uint32_t procIdx, assignIdx, targetSig; };
+    std::vector<CombAssign> sortedCombAssigns_;
+    struct FFRegion { uint32_t offset, bytes; };
+    std::vector<FFRegion> ffRegions_;
+
+    // Per-function SSA values (reset for each generated function)
+    std::vector<llvm::Value*> signalValues_;
+
+    // ── Analysis (compile-time, done once) ──────────────────────────────
+
+    void analyzeProcesses() {
+        combWritten_.assign(mod_.signals.size(), false);
+        for (auto& proc : mod_.processes) {
+            if (proc.kind != ir::Process::Combinational) continue;
+            for (auto& assign : proc.assignments)
+                if (!assign.indexExpr)
+                    combWritten_[assign.targetIndex] = true;
+        }
+    }
+
+    void collectSignalRefs(const ir::ExprPtr& expr, std::vector<uint32_t>& refs) {
+        if (!expr) return;
+        if (expr->kind == ir::ExprKind::SignalRef)
+            refs.push_back(expr->signalIndex);
+        for (auto& op : expr->operands)
+            collectSignalRefs(op, refs);
+    }
+
+    std::vector<CombAssign> topoSortCombAssigns() {
+        std::vector<CombAssign> assigns;
+        for (uint32_t p = 0; p < mod_.processes.size(); p++) {
+            auto& proc = mod_.processes[p];
+            if (proc.kind != ir::Process::Combinational) continue;
+            for (uint32_t a = 0; a < proc.assignments.size(); a++) {
+                if (proc.assignments[a].indexExpr) continue;
+                assigns.push_back({p, a, proc.assignments[a].targetIndex});
+            }
+        }
+        if (assigns.empty()) return assigns;
+
+        std::unordered_map<uint32_t, uint32_t> sigToIdx;
+        for (uint32_t i = 0; i < assigns.size(); i++)
+            sigToIdx[assigns[i].targetSig] = i;
+
+        uint32_t n = assigns.size();
+        std::vector<std::vector<uint32_t>> adj(n);
+        std::vector<uint32_t> inDeg(n, 0);
+
+        for (uint32_t i = 0; i < n; i++) {
+            auto& assign = mod_.processes[assigns[i].procIdx].assignments[assigns[i].assignIdx];
+            std::vector<uint32_t> refs;
+            collectSignalRefs(assign.value, refs);
+            std::sort(refs.begin(), refs.end());
+            refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+            for (auto ref : refs) {
+                auto it = sigToIdx.find(ref);
+                if (it != sigToIdx.end() && it->second != i) {
+                    adj[it->second].push_back(i);
+                    inDeg[i]++;
+                }
+            }
+        }
+
+        std::queue<uint32_t> q;
+        for (uint32_t i = 0; i < n; i++)
+            if (inDeg[i] == 0) q.push(i);
+
+        std::vector<CombAssign> sorted;
+        sorted.reserve(n);
+        while (!q.empty()) {
+            auto u = q.front(); q.pop();
+            sorted.push_back(assigns[u]);
+            for (auto v : adj[u])
+                if (--inDeg[v] == 0) q.push(v);
+        }
+        return (sorted.size() < n) ? assigns : sorted;
+    }
+
+    std::vector<FFRegion> computeFFRegions() {
+        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+        for (auto& sig : mod_.signals) {
+            if (!sig.isFF) continue;
+            ranges.push_back({sig.stateOffset, ir::bytesForWidth(sig.width)});
+        }
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<FFRegion> regions;
+        for (auto& [off, len] : ranges) {
+            if (!regions.empty() && regions.back().offset + regions.back().bytes == off)
+                regions.back().bytes += len;
+            else
+                regions.push_back({off, len});
+        }
+        return regions;
+    }
+
+    // ── Code generation ─────────────────────────────────────────────────
+
+    /// Emit the eval body (SSA signal promotion) at the current insert point.
+    /// Reads from state, writes comb to state, writes seq to nextState.
+    void emitEvalBody(llvm::Value* state, llvm::Value* nextState) {
+        const uint32_t numSigs = mod_.signals.size();
+        signalValues_.assign(numSigs, nullptr);
+
+        // Pre-load all non-comb-written signals from state
+        for (uint32_t i = 0; i < numSigs; i++) {
+            if (!combWritten_[i])
+                signalValues_[i] = loadSignal(state, mod_.signals[i]);
+        }
+
+        // Emit comb scalar assignments in topological order
+        for (auto& [procIdx, assignIdx, targetSig] : sortedCombAssigns_) {
+            auto& assign = mod_.processes[procIdx].assignments[assignIdx];
+            auto* val = emitExpr(assign.value, state);
+            signalValues_[targetSig] = matchWidth(val, mod_.signals[targetSig].width);
+        }
+
+        // Emit comb array stores (still through memory)
+        for (auto& proc : mod_.processes) {
+            if (proc.kind != ir::Process::Combinational) continue;
+            for (auto& assign : proc.assignments) {
+                if (!assign.indexExpr) continue;
+                auto* val = emitExpr(assign.value, state);
+                emitArrayStore(state, state, assign, val);
+            }
+        }
+
+        // Store comb scalar values to state (for runtime/VCD to read)
+        for (uint32_t i = 0; i < numSigs; i++) {
+            if (combWritten_[i] && signalValues_[i])
+                storeSignal(state, mod_.signals[i], signalValues_[i]);
+        }
+
+        // Emit sequential assignments (read SSA values, write to nextState)
+        for (auto& proc : mod_.processes) {
+            if (proc.kind != ir::Process::Sequential) continue;
+            for (auto& assign : proc.assignments) {
+                auto* val = emitExpr(assign.value, state);
+                if (assign.indexExpr)
+                    emitArrayStore(nextState, state, assign, val);
+                else
+                    storeSignal(nextState, mod_.signals[assign.targetIndex], val);
+            }
+        }
+    }
+
+    /// Emit inline commitFFs: memcpy from nextState to state for each FF region
+    void emitCommitFFs(llvm::Value* state, llvm::Value* nextState) {
+        auto* i8Ty  = llvm::Type::getInt8Ty(ctx_);
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx_);
+        for (auto& r : ffRegions_) {
+            auto* src = builder_.CreateGEP(i8Ty, nextState,
+                llvm::ConstantInt::get(i32Ty, r.offset));
+            auto* dst = builder_.CreateGEP(i8Ty, state,
+                llvm::ConstantInt::get(i32Ty, r.offset));
+            builder_.CreateMemCpy(dst, llvm::MaybeAlign(1), src,
+                                  llvm::MaybeAlign(1), r.bytes);
+        }
+    }
+
+    /// Generate: void eval(i8* state, i8* next_state)
+    void generateEval() {
+        auto* ptrTy  = llvm::PointerType::getUnqual(ctx_);
+        auto* voidTy = llvm::Type::getVoidTy(ctx_);
+        auto* fnTy   = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy}, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                           "eval", llvmMod_);
+        fn->getArg(0)->setName("state");
+        fn->getArg(1)->setName("next_state");
+        fn->getArg(0)->addAttr(llvm::Attribute::NoAlias);
+        fn->getArg(1)->addAttr(llvm::Attribute::NoAlias);
+
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn);
+        builder_.SetInsertPoint(entry);
+        emitEvalBody(fn->getArg(0), fn->getArg(1));
+        builder_.CreateRetVoid();
+    }
+
+    /// Generate: void simulate(i8* state, i8* next_state, i64 cycles)
+    /// Contains the simulation loop with inline commitFFs.
+    void generateSimulate() {
+        auto* ptrTy  = llvm::PointerType::getUnqual(ctx_);
+        auto* voidTy = llvm::Type::getVoidTy(ctx_);
+        auto* i64Ty  = llvm::Type::getInt64Ty(ctx_);
+        auto* fnTy   = llvm::FunctionType::get(voidTy, {ptrTy, ptrTy, i64Ty}, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                           "simulate", llvmMod_);
+        fn->getArg(0)->setName("state");
+        fn->getArg(1)->setName("next_state");
+        fn->getArg(2)->setName("cycles");
+        fn->getArg(0)->addAttr(llvm::Attribute::NoAlias);
+        fn->getArg(1)->addAttr(llvm::Attribute::NoAlias);
+        fn->addFnAttr(llvm::Attribute::NoUnwind);
+
+        auto* state     = fn->getArg(0);
+        auto* nextState = fn->getArg(1);
+        auto* cycles    = fn->getArg(2);
+
+        auto* entry = llvm::BasicBlock::Create(ctx_, "entry", fn);
+        auto* loop  = llvm::BasicBlock::Create(ctx_, "loop", fn);
+        auto* exit  = llvm::BasicBlock::Create(ctx_, "exit", fn);
+
+        // Entry: branch to loop
+        builder_.SetInsertPoint(entry);
+        auto* zero = llvm::ConstantInt::get(i64Ty, 0);
+        auto* skipLoop = builder_.CreateICmpEQ(cycles, zero);
+        builder_.CreateCondBr(skipLoop, exit, loop);
+
+        // Loop body: eval + commitFFs + increment
+        builder_.SetInsertPoint(loop);
+        auto* i = builder_.CreatePHI(i64Ty, 2, "i");
+        i->addIncoming(zero, entry);
+
+        emitEvalBody(state, nextState);
+        emitCommitFFs(state, nextState);
+
+        auto* iNext = builder_.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1));
+        i->addIncoming(iNext, builder_.GetInsertBlock());
+        auto* done = builder_.CreateICmpUGE(iNext, cycles);
+        builder_.CreateCondBr(done, exit, loop);
+
+        // Exit
+        builder_.SetInsertPoint(exit);
+        builder_.CreateRetVoid();
+    }
 
     /// Get LLVM integer type for a signal width
     llvm::IntegerType* intTy(uint32_t bits) {
@@ -170,7 +375,10 @@ private:
                 return llvm::ConstantInt::get(intTy(expr->width), expr->constVal);
 
             case ir::ExprKind::SignalRef: {
-                auto& sig = mod_.signals[expr->signalIndex];
+                auto idx = expr->signalIndex;
+                if (idx < signalValues_.size() && signalValues_[idx])
+                    return signalValues_[idx];
+                auto& sig = mod_.signals[idx];
                 return loadSignal(stateBase, sig);
             }
 
@@ -402,14 +610,22 @@ CompiledModule Compiler::compile(const ir::Module& mod) {
         return result;
     }
 
-    auto sym = jit->lookup("eval");
-    if (!sym) {
+    auto evalSym = jit->lookup("eval");
+    if (!evalSym) {
         std::cerr << "surge: failed to lookup eval: "
-                  << llvm::toString(sym.takeError()) << "\n";
+                  << llvm::toString(evalSym.takeError()) << "\n";
         return result;
     }
+    result.evalFn_ = evalSym->toPtr<void(uint8_t*, uint8_t*)>();
 
-    result.evalFn_ = sym->toPtr<void(uint8_t*, uint8_t*)>();
+    auto simSym = jit->lookup("simulate");
+    if (!simSym) {
+        std::cerr << "surge: failed to lookup simulate: "
+                  << llvm::toString(simSym.takeError()) << "\n";
+        return result;
+    }
+    result.simulateFn_ = simSym->toPtr<void(uint8_t*, uint8_t*, uint64_t)>();
+
     result.impl_ = std::make_unique<CompiledModule::Impl>();
     result.impl_->jit = std::move(jit);
 

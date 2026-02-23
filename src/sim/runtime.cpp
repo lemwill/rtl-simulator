@@ -6,8 +6,9 @@
 
 namespace surge::sim {
 
-Runtime::Runtime(const ir::Module& mod, codegen::EvalFn evalFn, const SimConfig& cfg)
-    : mod_(mod), evalFn_(evalFn), cfg_(cfg)
+Runtime::Runtime(const ir::Module& mod, codegen::EvalFn evalFn,
+                 codegen::SimulateFn simulateFn, const SimConfig& cfg)
+    : mod_(mod), evalFn_(evalFn), simulateFn_(simulateFn), cfg_(cfg)
 {
     state_.resize(mod.stateSize, 0);
     nextState_.resize(mod.stateSize, 0);
@@ -51,16 +52,23 @@ SimResult Runtime::run() {
     // Main simulation loop (timed)
     auto startTime = std::chrono::high_resolution_clock::now();
 
-    for (uint64_t cycle = 0; cycle < cfg_.maxCycles; cycle++) {
+    if (simulateFn_ && !vcd_) {
+        // Fast path: JIT loop with inline commitFFs — no per-cycle C++ overhead
         writeSignal(clkSig->index, 1);
-        evalFn_(state_.data(), nextState_.data());
-        commitFFs();
-        traceAll();
-        time_ += 5;
+        simulateFn_(state_.data(), nextState_.data(), cfg_.maxCycles);
+    } else {
+        // Trace path: per-cycle eval with VCD output
+        for (uint64_t cycle = 0; cycle < cfg_.maxCycles; cycle++) {
+            writeSignal(clkSig->index, 1);
+            evalFn_(state_.data(), nextState_.data());
+            commitFFs();
+            traceAll();
+            time_ += 5;
 
-        writeSignal(clkSig->index, 0);
-        traceAll();
-        time_ += 5;
+            writeSignal(clkSig->index, 0);
+            traceAll();
+            time_ += 5;
+        }
     }
 
     auto endTime = std::chrono::high_resolution_clock::now();

@@ -6,8 +6,11 @@
 
 namespace surge::codegen {
 
-/// Function pointer type: eval(state*, next_state*)
+/// Function pointer type: eval(state*, next_state*) — single cycle
 using EvalFn = void (*)(uint8_t*, uint8_t*);
+
+/// Function pointer type: simulate(state*, next_state*, cycles) — JIT loop
+using SimulateFn = void (*)(uint8_t*, uint8_t*, uint64_t);
 
 /// Compiled module: holds JIT state and the eval function pointer.
 class CompiledModule {
@@ -17,6 +20,7 @@ public:
     CompiledModule& operator=(CompiledModule&&) noexcept;
 
     EvalFn evalFn() const { return evalFn_; }
+    SimulateFn simulateFn() const { return simulateFn_; }
     const std::string& irDump() const { return irDump_; }
 
     // Non-copyable
@@ -28,6 +32,7 @@ private:
     CompiledModule() = default;
 
     EvalFn evalFn_ = nullptr;
+    SimulateFn simulateFn_ = nullptr;
     std::string irDump_;
     struct Impl;
     std::unique_ptr<Impl> impl_;

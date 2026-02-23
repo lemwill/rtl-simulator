@@ -23,7 +23,8 @@ struct SimResult {
 
 class Runtime {
 public:
-    Runtime(const ir::Module& mod, codegen::EvalFn evalFn, const SimConfig& cfg);
+    Runtime(const ir::Module& mod, codegen::EvalFn evalFn,
+            codegen::SimulateFn simulateFn, const SimConfig& cfg);
     ~Runtime();
 
     /// Run the simulation for cfg.maxCycles clock cycles.
@@ -40,6 +41,7 @@ public:
 private:
     const ir::Module& mod_;
     codegen::EvalFn evalFn_;
+    codegen::SimulateFn simulateFn_;
     SimConfig cfg_;
 
     std::vector<uint8_t> state_;

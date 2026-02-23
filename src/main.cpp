@@ -74,7 +74,7 @@ int main(int argc, char* argv[]) {
     }
 
     // 3. Simulate
-    surge::sim::Runtime runtime(*mod, compiled.evalFn(), cfg);
+    surge::sim::Runtime runtime(*mod, compiled.evalFn(), compiled.simulateFn(), cfg);
     auto simResult = runtime.run();
 
     // 4. Print final signal values

@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 5 complete.** Self-stimulus benchmarks, 3-stage pipeline, multi-module hierarchy.
+**Sprint 6 complete.** SSA signal promotion + JIT simulation loop. Pipeline 33→130 MHz (5.8x Verilator).
 
 Next priorities:
-1. **Generate blocks**: Parameterized module generation.
-2. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
-3. **Combinational loop detection**: Prevent infinite loops in pure-combinational designs.
-4. **Signed arithmetic**: `signed` type handling and arithmetic right shift.
+1. **Signed arithmetic**: `signed` type handling and arithmetic right shift.
+2. **Generate blocks**: Parameterized module generation.
+3. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
+4. **Dead signal elimination**: Remove signals not read by any process or output.
 
 ### Project Structure
 ```
@@ -165,6 +165,21 @@ ALU: 4x speedup from computed store. Both designs now faster than Verilator.
 | 3-Stage Pipeline | **33 MHz** | 21 MHz | **1.6x** | PASS |
 
 Surge beats Verilator on all three designs with real LFSR-driven stimulus.
+
+### Sprint 6: SSA Signal Promotion + JIT Simulation Loop (complete)
+- **SSA signal promotion**: Pre-load all non-comb signals once at function entry; compute comb signals as pure SSA values in topological order; sequential processes read SSA values instead of re-loading from memory. Eliminates redundant loads (e.g., `lfsr` loaded 10x → 1x, `s2_op` 8x → 1x).
+- **Topological sort**: Combinational assignments sorted by signal dependencies (Kahn's algorithm). Detects combinational loops and falls back to original order.
+- **JIT simulation loop**: Generated `simulate(state, next_state, cycles)` function with eval body + inline commitFFs (LLVM memcpy intrinsics) in a tight loop. Eliminates per-cycle C++ function call overhead, clock toggle, and runtime commitFFs call. `noalias` attributes on state/next_state pointers enable aggressive LLVM optimization.
+- Runtime uses `simulateFn` for no-VCD fast path, falls back to per-cycle `eval()` for VCD tracing.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Sprint 5 | Sprint 6 | Verilator 5.045 | Speedup | Correctness |
+|--------|----------|----------|-----------------|---------|-------------|
+| LFSR 8-bit | 132 MHz | **262 MHz** | 39 MHz | **6.7x** | PASS |
+| ALU+Regfile (self-stim) | 65 MHz | **126 MHz** | 26 MHz | **4.9x** | PASS |
+| 3-Stage Pipeline | 33 MHz | **130 MHz** | 22 MHz | **5.8x** | PASS |
+
+Pipeline: 3.9x improvement from Sprint 5 (33→130 MHz). Speedup now consistent across design complexity.
 
 ## Research
 
