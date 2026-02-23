@@ -1325,13 +1325,37 @@ private:
                 if (trackBlockValues_ && savedBV != savedBlockValues.end())
                     falseVal = savedBV->second;
                 else {
-                    auto& sig = mod_.signals[ifA.targetIndex];
-                    falseVal = Expr::signalRef(sig.width, sig.index);
+                    // Check if there's a pending assignment to this signal
+                    // in the outer scope (e.g., tx_valid <= 0 before if).
+                    // Use that value instead of signalRef so conditional
+                    // re-assignment merges correctly.
+                    int pendingIdx = -1;
+                    for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+                        if (assignments_[j].targetIndex == ifA.targetIndex && !assignments_[j].indexExpr) {
+                            falseVal = assignments_[j].value;
+                            pendingIdx = j;
+                            break;
+                        }
+                    }
+                    if (!falseVal) {
+                        auto& sig = mod_.signals[ifA.targetIndex];
+                        falseVal = Expr::signalRef(sig.width, sig.index);
+                    }
                 }
             }
             auto muxed = Expr::mux(mod_.signals[ifA.targetIndex].width,
                                    cond, ifA.value, falseVal);
-            assignments_.push_back({ifA.targetIndex, muxed});
+            // If there was a pending assignment, replace it in-place
+            bool replaced = false;
+            for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+                if (assignments_[j].targetIndex == ifA.targetIndex && !assignments_[j].indexExpr) {
+                    assignments_[j].value = muxed;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced)
+                assignments_.push_back({ifA.targetIndex, muxed});
             if (trackBlockValues_)
                 el_.setBlockValue(ifA.targetIndex, muxed);
         }
@@ -1347,10 +1371,29 @@ private:
                 auto savedBV = savedBlockValues.find(elseA.targetIndex);
                 if (trackBlockValues_ && savedBV != savedBlockValues.end())
                     trueVal = savedBV->second;
-                else
-                    trueVal = Expr::signalRef(sig.width, sig.index);
+                else {
+                    // Check pending assignment in outer scope
+                    for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+                        if (assignments_[j].targetIndex == elseA.targetIndex && !assignments_[j].indexExpr) {
+                            trueVal = assignments_[j].value;
+                            break;
+                        }
+                    }
+                    if (!trueVal)
+                        trueVal = Expr::signalRef(sig.width, sig.index);
+                }
                 auto muxed = Expr::mux(sig.width, cond, trueVal, elseA.value);
-                assignments_.push_back({elseA.targetIndex, muxed});
+                // Replace pending if exists
+                bool replaced = false;
+                for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+                    if (assignments_[j].targetIndex == elseA.targetIndex && !assignments_[j].indexExpr) {
+                        assignments_[j].value = muxed;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced)
+                    assignments_.push_back({elseA.targetIndex, muxed});
                 if (trackBlockValues_)
                     el_.setBlockValue(elseA.targetIndex, muxed);
             }
@@ -1387,7 +1430,12 @@ private:
         auto savedBlockValues = el_.saveBlockValues();
 
         // Collect default assignments (scalar only; array stores handled separately)
+        // Seed with pending outer assignments so case items see correct fallback values
         std::unordered_map<uint32_t, ExprPtr> currentValues;
+        for (auto& a : assignments_) {
+            if (!a.indexExpr)
+                currentValues[a.targetIndex] = a.value;
+        }
         std::vector<Assignment> arrayStoreAccum; // accumulated array stores with conditions
         if (cs.defaultCase) {
             el_.restoreBlockValues(savedBlockValues);
@@ -1453,7 +1501,17 @@ private:
 
         el_.restoreBlockValues(savedBlockValues);
         for (auto& [targetIdx, val] : currentValues) {
-            assignments_.push_back({targetIdx, val});
+            // Replace pending outer assignment if it exists
+            bool replaced = false;
+            for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+                if (assignments_[j].targetIndex == targetIdx && !assignments_[j].indexExpr) {
+                    assignments_[j].value = val;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced)
+                assignments_.push_back({targetIdx, val});
             if (trackBlockValues_)
                 el_.setBlockValue(targetIdx, val);
         }
