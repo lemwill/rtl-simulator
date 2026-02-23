@@ -36,7 +36,7 @@ enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor };
 
 enum class BinaryOp {
     And, Or, Xor,
-    Add, Sub, Mul,
+    Add, Sub, Mul, Div, Mod,
     Eq, Neq, Lt, Lte, Gt, Gte,
     Shl, Shr, AShr,
 };
@@ -57,6 +57,7 @@ struct Expr {
     uint32_t arrayBaseIndex = 0; // ArrayElement: signal index of element [0]
     uint32_t arraySize      = 0; // ArrayElement: number of elements
     uint32_t elementWidth   = 0; // ArrayElement: bit width per element
+    bool     isSigned       = false; // true for signed comparison/arithmetic
     std::vector<ExprPtr> operands;
 
     // ── factories ──

@@ -11,6 +11,7 @@
 #include <slang/ast/expressions/OperatorExpressions.h>
 #include <slang/ast/expressions/ConversionExpression.h>
 #include <slang/ast/expressions/Operator.h>
+#include <slang/ast/expressions/CallExpression.h>
 #include <slang/ast/expressions/SelectExpressions.h>
 #include <slang/ast/statements/ConditionalStatements.h>
 #include <slang/ast/statements/LoopStatements.h>
@@ -112,6 +113,10 @@ public:
                 return lowerElementSelect(expr.as<slang::ast::ElementSelectExpression>());
             case slang::ast::ExpressionKind::RangeSelect:
                 return lowerRangeSelect(expr.as<slang::ast::RangeSelectExpression>());
+            case slang::ast::ExpressionKind::Replication:
+                return lowerReplication(expr.as<slang::ast::ReplicationExpression>());
+            case slang::ast::ExpressionKind::Call:
+                return lowerCall(expr.as<slang::ast::CallExpression>());
             default:
                 std::cerr << "surge: unsupported expression kind "
                           << static_cast<int>(expr.kind) << "\n";
@@ -228,7 +233,10 @@ private:
             case slang::ast::BinaryOperator::GreaterThanEqual: op = BinaryOp::Gte; break;
             case slang::ast::BinaryOperator::LogicalShiftLeft:  op = BinaryOp::Shl; break;
             case slang::ast::BinaryOperator::LogicalShiftRight: op = BinaryOp::Shr; break;
+            case slang::ast::BinaryOperator::ArithmeticShiftLeft:  op = BinaryOp::Shl; break;
             case slang::ast::BinaryOperator::ArithmeticShiftRight: op = BinaryOp::AShr; break;
+            case slang::ast::BinaryOperator::Divide:       op = BinaryOp::Div; break;
+            case slang::ast::BinaryOperator::Mod:          op = BinaryOp::Mod; break;
             case slang::ast::BinaryOperator::BinaryXnor:
                 return Expr::unary(UnaryOp::Not, w, Expr::binary(BinaryOp::Xor, w, lhs, rhs));
             case slang::ast::BinaryOperator::LogicalAnd: {
@@ -250,7 +258,11 @@ private:
                           << static_cast<int>(be.op) << "\n";
                 return lhs;
         }
-        return Expr::binary(op, w, lhs, rhs);
+        auto result = Expr::binary(op, w, lhs, rhs);
+        // Propagate signedness for comparison and arithmetic ops
+        if (be.left().type->isSigned() && be.right().type->isSigned())
+            result->isSigned = true;
+        return result;
     }
 
     ExprPtr lowerConditional(const slang::ast::ConditionalExpression& ce) {
@@ -267,7 +279,13 @@ private:
     }
 
     ExprPtr lowerConversion(const slang::ast::ConversionExpression& cv) {
-        return lower(cv.operand());
+        auto inner = lower(cv.operand());
+        // If the operand is signed and we're widening, we need sign-extension.
+        // Mark the expression so codegen can use sext instead of zext.
+        if (cv.operand().type->isSigned()) {
+            inner->isSigned = true;
+        }
+        return inner;
     }
 
     ExprPtr lowerConcat(const slang::ast::ConcatenationExpression& cc) {
@@ -275,6 +293,36 @@ private:
         for (auto* op : cc.operands())
             parts.push_back(lower(*op));
         return Expr::concat(getTypeWidth(*cc.type), std::move(parts));
+    }
+
+    ExprPtr lowerReplication(const slang::ast::ReplicationExpression& re) {
+        auto count = extractConstantInt(re.count());
+        if (!count || *count == 0)
+            return Expr::constant(1, 0);
+        auto inner = lower(re.concat());
+        uint32_t totalWidth = getTypeWidth(*re.type);
+        std::vector<ExprPtr> parts;
+        for (uint64_t i = 0; i < *count; i++)
+            parts.push_back(inner);
+        return Expr::concat(totalWidth, std::move(parts));
+    }
+
+    ExprPtr lowerCall(const slang::ast::CallExpression& call) {
+        // Handle $signed / $unsigned system calls — pass through the argument
+        if (call.isSystemCall()) {
+            auto name = call.getSubroutineName();
+            auto args = call.arguments();
+            if ((name == "$signed" || name == "$unsigned") && args.size() == 1) {
+                auto inner = lower(*args[0]);
+                if (name == "$signed")
+                    inner->isSigned = true;
+                else
+                    inner->isSigned = false;
+                return inner;
+            }
+        }
+        std::cerr << "surge: unsupported call: " << call.getSubroutineName() << "\n";
+        return Expr::constant(getTypeWidth(*call.type), 0);
     }
 
     ExprPtr lowerElementSelect(const slang::ast::ElementSelectExpression& es) {
