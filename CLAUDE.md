@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 6 complete.** SSA signal promotion + JIT simulation loop. Pipeline 33→130 MHz (5.8x Verilator).
+**Sprint 7 complete.** Signed arithmetic, $signed/$unsigned, replication, div/mod, RISC-V 5-stage pipeline (70 signals, 32x32 regfile, forwarding, 10 ALU ops). 3.3x Verilator on RISC-V, 11.6x on LFSR.
 
 Next priorities:
-1. **Signed arithmetic**: `signed` type handling and arithmetic right shift.
+1. **Dead signal elimination**: Remove signals not read by any process or output.
 2. **Generate blocks**: Parameterized module generation.
-3. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
-4. **Dead signal elimination**: Remove signals not read by any process or output.
+3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+4. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
 
 ### Project Structure
 ```
@@ -39,6 +39,7 @@ surge/
     alu_regfile_stim.sv
     pipeline_datapath.sv
     counter_hier.sv
+    riscv_pipeline.sv
   bench/
     run_bench.sh            # Surge vs Verilator benchmark
 ```
@@ -180,6 +181,23 @@ Surge beats Verilator on all three designs with real LFSR-driven stimulus.
 | 3-Stage Pipeline | 33 MHz | **130 MHz** | 22 MHz | **5.8x** | PASS |
 
 Pipeline: 3.9x improvement from Sprint 5 (33→130 MHz). Speedup now consistent across design complexity.
+
+### Sprint 7: Signed Arithmetic + RISC-V 5-Stage Pipeline (complete)
+- **Signed arithmetic**: `isSigned` flag on IR expressions, propagated from slang type system. Codegen emits `ICmpSLT/SLE/SGT/SGE` for signed comparisons, `CreateSExt` for sign-extension, `SDiv/SRem` for signed div/mod.
+- **$signed/$unsigned system calls**: `CallExpression` handling in builder — lowers argument with signedness flag.
+- **Replication operator**: `{N{expr}}` lowered as Concat with N copies.
+- **New binary ops**: `Div`, `Mod` in IR + codegen. `ArithmeticShiftLeft` mapped to `Shl`.
+- **RISC-V 5-stage pipeline** (`riscv_pipeline.sv`): LFSR instruction generator, IF/ID/EX/MEM/WB stages, 32x32 register file (x0 hardwired), data forwarding (MEM→ID, WB→ID), full RV32I ALU (ADD/SUB/SLL/SLT/SLTU/XOR/SRL/SRA/OR/AND + LUI), sign-extension via replication, checksum accumulator. 70 signals, 21 processes, 215 bytes state.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **268 MHz** | 23 MHz | **11.6x** | PASS |
+| ALU+Regfile (self-stim) | **125 MHz** | 33 MHz | **3.8x** | PASS |
+| 3-Stage Pipeline | **131 MHz** | 24 MHz | **5.4x** | PASS |
+| RISC-V 5-Stage Pipeline | **51 MHz** | 15 MHz | **3.3x** | PASS |
+
+RISC-V pipeline is the most complex design yet — 70 signals including a 32-entry register file with forwarding. Surge maintains 3.3x speedup at this scale.
 
 ## Research
 

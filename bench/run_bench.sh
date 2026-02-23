@@ -14,10 +14,10 @@ echo ""
 
 # ── Design list ───────────────────────────────────────────────────────────────
 
-declare -a DESIGNS=("lfsr" "alu_regfile_stim" "pipeline_datapath")
-declare -a LABELS=("LFSR (8-bit Galois)" "ALU+Regfile (self-stim)" "3-Stage Pipeline")
-declare -a SV_FILES=("$PROJECT_DIR/tests/lfsr.sv" "$PROJECT_DIR/tests/alu_regfile_stim.sv" "$PROJECT_DIR/tests/pipeline_datapath.sv")
-declare -a CHECK_SIGNALS=("lfsr_out" "result" "checksum")
+declare -a DESIGNS=("lfsr" "alu_regfile_stim" "pipeline_datapath" "riscv_pipeline")
+declare -a LABELS=("LFSR (8-bit Galois)" "ALU+Regfile (self-stim)" "3-Stage Pipeline" "RISC-V 5-Stage Pipeline")
+declare -a SV_FILES=("$PROJECT_DIR/tests/lfsr.sv" "$PROJECT_DIR/tests/alu_regfile_stim.sv" "$PROJECT_DIR/tests/pipeline_datapath.sv" "$PROJECT_DIR/tests/riscv_pipeline.sv")
+declare -a CHECK_SIGNALS=("lfsr_out" "result" "checksum" "checksum")
 
 # ── Surge Benchmarks ─────────────────────────────────────────────────────────
 

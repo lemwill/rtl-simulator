@@ -390,7 +390,7 @@ private:
             case ir::ExprKind::BinaryOp: {
                 auto* lhs = emitExpr(expr->operands[0], stateBase);
                 auto* rhs = emitExpr(expr->operands[1], stateBase);
-                return emitBinary(expr->binaryOp, lhs, rhs, expr->width);
+                return emitBinary(expr->binaryOp, lhs, rhs, expr->width, expr->isSigned);
             }
 
             case ir::ExprKind::Mux: {
@@ -473,10 +473,11 @@ private:
         }
     }
 
-    llvm::Value* matchWidth(llvm::Value* val, uint32_t targetWidth) {
+    llvm::Value* matchWidth(llvm::Value* val, uint32_t targetWidth, bool signExtend = false) {
         uint32_t curWidth = val->getType()->getIntegerBitWidth();
         if (curWidth < targetWidth)
-            return builder_.CreateZExt(val, intTy(targetWidth));
+            return signExtend ? builder_.CreateSExt(val, intTy(targetWidth))
+                              : builder_.CreateZExt(val, intTy(targetWidth));
         if (curWidth > targetWidth)
             return builder_.CreateTrunc(val, intTy(targetWidth));
         return val;
@@ -510,13 +511,14 @@ private:
         return a; // unreachable
     }
 
-    llvm::Value* emitBinary(ir::BinaryOp op, llvm::Value* l, llvm::Value* r, uint32_t w) {
+    llvm::Value* emitBinary(ir::BinaryOp op, llvm::Value* l, llvm::Value* r,
+                            uint32_t w, bool isSigned = false) {
         // Match operand widths to max(l, r, w)
         uint32_t lw = l->getType()->getIntegerBitWidth();
         uint32_t rw = r->getType()->getIntegerBitWidth();
         uint32_t maxW = std::max({lw, rw, w});
-        l = matchWidth(l, maxW);
-        r = matchWidth(r, maxW);
+        l = matchWidth(l, maxW, isSigned);
+        r = matchWidth(r, maxW, isSigned);
 
         llvm::Value* result;
         switch (op) {
@@ -526,15 +528,33 @@ private:
             case ir::BinaryOp::Add: result = builder_.CreateAdd(l, r); break;
             case ir::BinaryOp::Sub: result = builder_.CreateSub(l, r); break;
             case ir::BinaryOp::Mul: result = builder_.CreateMul(l, r); break;
+            case ir::BinaryOp::Div:
+                result = isSigned ? builder_.CreateSDiv(l, r) : builder_.CreateUDiv(l, r);
+                break;
+            case ir::BinaryOp::Mod:
+                result = isSigned ? builder_.CreateSRem(l, r) : builder_.CreateURem(l, r);
+                break;
             case ir::BinaryOp::Shl: result = builder_.CreateShl(l, r); break;
             case ir::BinaryOp::Shr: result = builder_.CreateLShr(l, r); break;
             case ir::BinaryOp::AShr: result = builder_.CreateAShr(l, r); break;
             case ir::BinaryOp::Eq:  result = builder_.CreateZExt(builder_.CreateICmpEQ(l, r), intTy(w)); break;
             case ir::BinaryOp::Neq: result = builder_.CreateZExt(builder_.CreateICmpNE(l, r), intTy(w)); break;
-            case ir::BinaryOp::Lt:  result = builder_.CreateZExt(builder_.CreateICmpULT(l, r), intTy(w)); break;
-            case ir::BinaryOp::Lte: result = builder_.CreateZExt(builder_.CreateICmpULE(l, r), intTy(w)); break;
-            case ir::BinaryOp::Gt:  result = builder_.CreateZExt(builder_.CreateICmpUGT(l, r), intTy(w)); break;
-            case ir::BinaryOp::Gte: result = builder_.CreateZExt(builder_.CreateICmpUGE(l, r), intTy(w)); break;
+            case ir::BinaryOp::Lt:
+                result = builder_.CreateZExt(
+                    isSigned ? builder_.CreateICmpSLT(l, r) : builder_.CreateICmpULT(l, r), intTy(w));
+                break;
+            case ir::BinaryOp::Lte:
+                result = builder_.CreateZExt(
+                    isSigned ? builder_.CreateICmpSLE(l, r) : builder_.CreateICmpULE(l, r), intTy(w));
+                break;
+            case ir::BinaryOp::Gt:
+                result = builder_.CreateZExt(
+                    isSigned ? builder_.CreateICmpSGT(l, r) : builder_.CreateICmpUGT(l, r), intTy(w));
+                break;
+            case ir::BinaryOp::Gte:
+                result = builder_.CreateZExt(
+                    isSigned ? builder_.CreateICmpSGE(l, r) : builder_.CreateICmpUGE(l, r), intTy(w));
+                break;
             default: result = l; break;
         }
         return matchWidth(result, w);
