@@ -63,6 +63,11 @@ int main(int argc, char* argv[]) {
     auto mod = surge::ir::buildFromFile(svFile);
     if (!mod) return 1;
 
+    // 1b. Dead signal elimination
+    uint32_t deadRemoved = mod->eliminateDeadSignals();
+    if (deadRemoved > 0)
+        std::cerr << "surge: eliminated " << deadRemoved << " dead assignments\n";
+
     // 2. Compile IR → LLVM → native
     surge::codegen::Compiler compiler;
     compiler.setDumpIR(cfg.dumpIR);

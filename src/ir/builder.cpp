@@ -101,6 +101,14 @@ public:
         switch (expr.kind) {
             case slang::ast::ExpressionKind::IntegerLiteral:
                 return lowerIntLiteral(expr.as<slang::ast::IntegerLiteral>());
+            case slang::ast::ExpressionKind::UnbasedUnsizedIntegerLiteral: {
+                auto& lit = expr.as<slang::ast::UnbasedUnsizedIntegerLiteral>();
+                auto sv = lit.getValue();
+                uint64_t v = 0;
+                if (auto opt = sv.as<uint64_t>())
+                    v = *opt;
+                return Expr::constant(getTypeWidth(*lit.type), v);
+            }
             case slang::ast::ExpressionKind::NamedValue:
                 return lowerNamedValue(expr.as<slang::ast::NamedValueExpression>());
             case slang::ast::ExpressionKind::UnaryOp:
@@ -326,10 +334,11 @@ private:
     }
 
     ExprPtr lowerCall(const slang::ast::CallExpression& call) {
-        // Handle $signed / $unsigned system calls — pass through the argument
         if (call.isSystemCall()) {
             auto name = call.getSubroutineName();
             auto args = call.arguments();
+
+            // $signed / $unsigned — pass through with signedness flag
             if ((name == "$signed" || name == "$unsigned") && args.size() == 1) {
                 auto inner = lower(*args[0]);
                 if (name == "$signed")
@@ -337,6 +346,43 @@ private:
                 else
                     inner->isSigned = false;
                 return inner;
+            }
+
+            // $countones — population count
+            if (name == "$countones" && args.size() == 1) {
+                auto inner = lower(*args[0]);
+                return Expr::unary(UnaryOp::Popcount, getTypeWidth(*call.type), inner);
+            }
+
+            // $onehot — exactly one bit set (popcount == 1)
+            if (name == "$onehot" && args.size() == 1) {
+                auto inner = lower(*args[0]);
+                auto pop = Expr::unary(UnaryOp::Popcount, inner->width, inner);
+                return Expr::binary(BinaryOp::Eq, 1, pop,
+                    Expr::constant(inner->width, 1));
+            }
+
+            // $onehot0 — zero or one bit set (popcount <= 1)
+            if (name == "$onehot0" && args.size() == 1) {
+                auto inner = lower(*args[0]);
+                auto pop = Expr::unary(UnaryOp::Popcount, inner->width, inner);
+                return Expr::binary(BinaryOp::Lte, 1, pop,
+                    Expr::constant(inner->width, 1));
+            }
+
+            // $isunknown — always 0 in 2-state simulation
+            if (name == "$isunknown" && args.size() == 1) {
+                return Expr::constant(1, 0);
+            }
+
+            // $clog2, $bits — try compile-time constant evaluation
+            if (auto* cv = call.getConstant()) {
+                if (cv->isInteger()) {
+                    uint64_t v = 0;
+                    if (auto opt = cv->integer().as<uint64_t>())
+                        v = *opt;
+                    return Expr::constant(getTypeWidth(*call.type), v);
+                }
             }
         }
         std::cerr << "surge: unsupported call: " << call.getSubroutineName() << "\n";

@@ -101,4 +101,97 @@ void Module::computeLayout() {
     stateSize = offset;
 }
 
+// ── Dead signal elimination ─────────────────────────────────────────────────
+
+static void collectRefs(const ExprPtr& expr, std::vector<bool>& live) {
+    if (!expr) return;
+    switch (expr->kind) {
+        case ExprKind::SignalRef:
+            live[expr->signalIndex] = true;
+            break;
+        case ExprKind::ArrayElement:
+            // All elements in the array are potentially accessed
+            for (uint32_t i = 0; i < expr->arraySize; i++)
+                live[expr->arrayBaseIndex + i] = true;
+            break;
+        default:
+            break;
+    }
+    for (auto& op : expr->operands)
+        collectRefs(op, live);
+}
+
+uint32_t Module::eliminateDeadSignals() {
+    const uint32_t N = static_cast<uint32_t>(signals.size());
+    if (N == 0) return 0;
+
+    // Step 1: Seed live set with outputs, inputs, and clock signals
+    std::vector<bool> live(N, false);
+    for (auto& sig : signals) {
+        if (sig.kind == SignalKind::Output || sig.kind == SignalKind::Input)
+            live[sig.index] = true;
+    }
+    for (auto& proc : processes) {
+        if (proc.kind == Process::Sequential)
+            live[proc.clockSignalIndex] = true;
+    }
+
+    // Step 2: Build a map from signal index → driving expressions
+    // (assignments whose target is this signal)
+    std::vector<std::vector<const Assignment*>> drivers(N);
+    for (auto& proc : processes) {
+        for (auto& assign : proc.assignments) {
+            if (assign.arraySize > 0) {
+                // Array store: all elements are potential targets
+                for (uint32_t i = 0; i < assign.arraySize; i++)
+                    drivers[assign.targetIndex + i].push_back(&assign);
+            } else {
+                drivers[assign.targetIndex].push_back(&assign);
+            }
+        }
+    }
+
+    // Step 3: BFS — propagate liveness through expressions
+    std::vector<uint32_t> worklist;
+    for (uint32_t i = 0; i < N; i++)
+        if (live[i]) worklist.push_back(i);
+
+    while (!worklist.empty()) {
+        uint32_t idx = worklist.back();
+        worklist.pop_back();
+        for (auto* assign : drivers[idx]) {
+            auto prevCount = worklist.size();
+            // Collect signal refs from value expression
+            std::vector<bool> before = live;
+            collectRefs(assign->value, live);
+            collectRefs(assign->indexExpr, live);
+            // Add newly discovered live signals to worklist
+            for (uint32_t j = 0; j < N; j++) {
+                if (live[j] && !before[j])
+                    worklist.push_back(j);
+            }
+        }
+    }
+
+    // Step 4: Remove assignments to dead signals
+    uint32_t removed = 0;
+    for (auto& proc : processes) {
+        auto& assigns = proc.assignments;
+        auto newEnd = std::remove_if(assigns.begin(), assigns.end(),
+            [&](const Assignment& a) {
+                if (a.arraySize > 0) {
+                    // Array store: keep if any element is live
+                    for (uint32_t i = 0; i < a.arraySize; i++)
+                        if (live[a.targetIndex + i]) return false;
+                    return true;
+                }
+                return !live[a.targetIndex];
+            });
+        removed += static_cast<uint32_t>(assigns.end() - newEnd);
+        assigns.erase(newEnd, assigns.end());
+    }
+
+    return removed;
+}
+
 } // namespace surge::ir

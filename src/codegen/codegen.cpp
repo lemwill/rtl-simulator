@@ -707,6 +707,10 @@ private:
                 }
                 return builder_.CreateZExt(result, intTy(w));
             }
+            case ir::UnaryOp::Popcount: {
+                auto* pop = builder_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, a);
+                return builder_.CreateZExtOrTrunc(pop, intTy(w));
+            }
         }
         return a; // unreachable
     }

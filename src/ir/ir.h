@@ -32,7 +32,7 @@ enum class ExprKind {
     ArrayElement, // dynamic unpacked array element access
 };
 
-enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor };
+enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor, Popcount };
 
 enum class BinaryOp {
     And, Or, Xor,
@@ -108,6 +108,7 @@ struct Module {
     uint32_t addSignal(const std::string& n, uint32_t w, SignalKind k);
     const Signal* findSignal(const std::string& n) const;
     void computeLayout();
+    uint32_t eliminateDeadSignals(); // returns number of dead assignments removed
 };
 
 // ── Convenience ─────────────────────────────────────────────────────────────
