@@ -2,7 +2,7 @@
 
 ## What To Do Next
 
-**Sprint 7 complete.** Signed arithmetic, $signed/$unsigned, replication, div/mod, RISC-V 5-stage pipeline (70 signals, 32x32 regfile, forwarding, 10 ALU ops). 3.3x Verilator on RISC-V, 11.6x on LFSR.
+**Sprint 8 complete.** Identity-mux elimination with pre-copy. RISC-V pipeline 51→68 MHz (+33%).
 
 Next priorities:
 1. **Dead signal elimination**: Remove signals not read by any process or output.
@@ -198,6 +198,22 @@ Pipeline: 3.9x improvement from Sprint 5 (33→130 MHz). Speedup now consistent 
 | RISC-V 5-Stage Pipeline | **51 MHz** | 15 MHz | **3.3x** | PASS |
 
 RISC-V pipeline is the most complex design yet — 70 signals including a 32-entry register file with forwarding. Surge maintains 3.3x speedup at this scale.
+
+### Sprint 8: Identity-Mux Elimination (complete)
+- **Pre-copy optimization**: In `generateSimulate()`, copy FF regions from state→nextState before eval. This ensures all FFs start with current values, making identity stores redundant.
+- **Identity-mux detection**: Detect `Mux(cond, val, SignalRef(target))` patterns in sequential assignments. When the false-branch is a self-reference (keep current value), emit conditional store only for the true-branch. Handles nested identity mux chains.
+- **Threshold gating**: Only enable pre-copy when ≥4 identity muxes are detected, avoiding overhead on simple designs.
+- Primary beneficiary: RISC-V pipeline with 32x32 register file — 32 identity copies per cycle eliminated.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Sprint 7 | Sprint 8 | Verilator 5.045 | Speedup | Correctness |
+|--------|----------|----------|-----------------|---------|-------------|
+| LFSR 8-bit | 268 MHz | **265 MHz** | 26 MHz | **10.2x** | PASS |
+| ALU+Regfile (self-stim) | 125 MHz | **130 MHz** | 32 MHz | **4.1x** | PASS |
+| 3-Stage Pipeline | 131 MHz | **138 MHz** | 29 MHz | **4.8x** | PASS |
+| RISC-V 5-Stage Pipeline | 51 MHz | **68 MHz** | 22 MHz | **3.1x** | PASS |
+
+RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 
 ## Research
 

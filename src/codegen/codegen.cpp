@@ -81,15 +81,28 @@ private:
     // Per-function SSA values (reset for each generated function)
     std::vector<llvm::Value*> signalValues_;
 
+    // Whether the current function pre-copies state→nextState (enables identity elision)
+    bool preCopied_ = false;
+    // Number of identity mux assignments detected (set by analysis)
+    uint32_t identityMuxCount_ = 0;
+
     // ── Analysis (compile-time, done once) ──────────────────────────────
 
     void analyzeProcesses() {
         combWritten_.assign(mod_.signals.size(), false);
+        identityMuxCount_ = 0;
         for (auto& proc : mod_.processes) {
-            if (proc.kind != ir::Process::Combinational) continue;
-            for (auto& assign : proc.assignments)
-                if (!assign.indexExpr)
-                    combWritten_[assign.targetIndex] = true;
+            if (proc.kind == ir::Process::Combinational) {
+                for (auto& assign : proc.assignments)
+                    if (!assign.indexExpr)
+                        combWritten_[assign.targetIndex] = true;
+            } else if (proc.kind == ir::Process::Sequential) {
+                for (auto& assign : proc.assignments) {
+                    if (!assign.indexExpr &&
+                        isNestedIdentityMux(assign.value, assign.targetIndex))
+                        identityMuxCount_++;
+                }
+            }
         }
     }
 
@@ -168,6 +181,169 @@ private:
         return regions;
     }
 
+    // ── Identity assignment detection ─────────────────────────────────
+
+    /// Check if an expression is Mux(cond, val, SignalRef(targetIdx))
+    /// i.e., the false-branch is the identity (keep current value).
+    /// Returns true and sets outCond/outTrueVal if so.
+    bool isIdentityMux(const ir::ExprPtr& expr, uint32_t targetIdx,
+                       const ir::ExprPtr*& outCond, const ir::ExprPtr*& outTrueVal) {
+        if (expr->kind != ir::ExprKind::Mux) return false;
+        auto& falseBranch = expr->operands[2];
+        if (falseBranch->kind == ir::ExprKind::SignalRef &&
+            falseBranch->signalIndex == targetIdx) {
+            outCond = &expr->operands[0];
+            outTrueVal = &expr->operands[1];
+            return true;
+        }
+        return false;
+    }
+
+    /// Recursively check for nested identity mux pattern:
+    /// Mux(rst, resetVal, Mux(cond2, val2, SignalRef(target)))
+    /// Returns true if the outermost false-path eventually resolves to identity.
+    bool isNestedIdentityMux(const ir::ExprPtr& expr, uint32_t targetIdx) {
+        if (expr->kind != ir::ExprKind::Mux) return false;
+        auto& falseBranch = expr->operands[2];
+        if (falseBranch->kind == ir::ExprKind::SignalRef &&
+            falseBranch->signalIndex == targetIdx)
+            return true;
+        // Check if false branch is itself an identity mux
+        if (falseBranch->kind == ir::ExprKind::Mux)
+            return isNestedIdentityMux(falseBranch, targetIdx);
+        return false;
+    }
+
+    /// Emit a conditional store for an identity-mux assignment.
+    /// Instead of: store(mux(cond, val, current))
+    /// Emits: if (cond) store(val)  [pre-copy handles the !cond case]
+    void emitConditionalStore(llvm::Value* nextState, llvm::Value* stateBase,
+                              const ir::Assignment& assign) {
+        auto& expr = assign.value;
+        auto& sig = mod_.signals[assign.targetIndex];
+
+        if (expr->kind == ir::ExprKind::Mux) {
+            auto& falseBranch = expr->operands[2];
+
+            if (falseBranch->kind == ir::ExprKind::SignalRef &&
+                falseBranch->signalIndex == assign.targetIndex) {
+                // Simple: Mux(cond, val, self) → if (cond) store val
+                auto* cond = emitExpr(expr->operands[0], stateBase);
+                if (cond->getType()->getIntegerBitWidth() > 1)
+                    cond = builder_.CreateICmpNE(cond,
+                        llvm::ConstantInt::get(cond->getType(), 0));
+                auto* val = emitExpr(expr->operands[1], stateBase);
+                val = matchWidth(val, sig.width);
+
+                auto* fn = builder_.GetInsertBlock()->getParent();
+                auto* storeBB = llvm::BasicBlock::Create(ctx_, "cstore", fn);
+                auto* mergeBB = llvm::BasicBlock::Create(ctx_, "cmerge", fn);
+                builder_.CreateCondBr(cond, storeBB, mergeBB);
+
+                builder_.SetInsertPoint(storeBB);
+                storeSignal(nextState, sig, val);
+                builder_.CreateBr(mergeBB);
+
+                builder_.SetInsertPoint(mergeBB);
+                return;
+            }
+
+            if (falseBranch->kind == ir::ExprKind::Mux &&
+                isNestedIdentityMux(falseBranch, assign.targetIndex)) {
+                // Nested: Mux(cond1, val1, Mux(cond2, val2, self))
+                // → if (cond1) store val1; else if (cond2) store val2
+                auto* cond1 = emitExpr(expr->operands[0], stateBase);
+                if (cond1->getType()->getIntegerBitWidth() > 1)
+                    cond1 = builder_.CreateICmpNE(cond1,
+                        llvm::ConstantInt::get(cond1->getType(), 0));
+                auto* val1 = emitExpr(expr->operands[1], stateBase);
+                val1 = matchWidth(val1, sig.width);
+
+                auto* fn = builder_.GetInsertBlock()->getParent();
+                auto* thenBB = llvm::BasicBlock::Create(ctx_, "cstore1", fn);
+                auto* elseBB = llvm::BasicBlock::Create(ctx_, "celse", fn);
+                auto* mergeBB = llvm::BasicBlock::Create(ctx_, "cmerge", fn);
+
+                builder_.CreateCondBr(cond1, thenBB, elseBB);
+
+                builder_.SetInsertPoint(thenBB);
+                storeSignal(nextState, sig, val1);
+                builder_.CreateBr(mergeBB);
+
+                // Handle the inner mux in the else branch
+                builder_.SetInsertPoint(elseBB);
+                emitConditionalStoreInner(nextState, stateBase, assign.targetIndex,
+                                          falseBranch, mergeBB);
+
+                builder_.SetInsertPoint(mergeBB);
+                return;
+            }
+        }
+
+        // Fallback: emit normally
+        auto* val = emitExpr(assign.value, stateBase);
+        storeSignal(nextState, sig, val);
+    }
+
+    /// Helper for nested identity mux chains
+    void emitConditionalStoreInner(llvm::Value* nextState, llvm::Value* stateBase,
+                                   uint32_t targetIdx,
+                                   const ir::ExprPtr& expr,
+                                   llvm::BasicBlock* mergeBB) {
+        auto& sig = mod_.signals[targetIdx];
+        if (expr->kind == ir::ExprKind::Mux) {
+            auto& falseBranch = expr->operands[2];
+            if (falseBranch->kind == ir::ExprKind::SignalRef &&
+                falseBranch->signalIndex == targetIdx) {
+                // Base case: Mux(cond, val, self) → if (cond) store val
+                auto* cond = emitExpr(expr->operands[0], stateBase);
+                if (cond->getType()->getIntegerBitWidth() > 1)
+                    cond = builder_.CreateICmpNE(cond,
+                        llvm::ConstantInt::get(cond->getType(), 0));
+                auto* val = emitExpr(expr->operands[1], stateBase);
+                val = matchWidth(val, sig.width);
+
+                auto* fn = builder_.GetInsertBlock()->getParent();
+                auto* storeBB = llvm::BasicBlock::Create(ctx_, "cstore_inner", fn);
+                builder_.CreateCondBr(cond, storeBB, mergeBB);
+
+                builder_.SetInsertPoint(storeBB);
+                storeSignal(nextState, sig, val);
+                builder_.CreateBr(mergeBB);
+                return;
+            }
+            if (falseBranch->kind == ir::ExprKind::Mux &&
+                isNestedIdentityMux(falseBranch, targetIdx)) {
+                // Recurse
+                auto* cond = emitExpr(expr->operands[0], stateBase);
+                if (cond->getType()->getIntegerBitWidth() > 1)
+                    cond = builder_.CreateICmpNE(cond,
+                        llvm::ConstantInt::get(cond->getType(), 0));
+                auto* val = emitExpr(expr->operands[1], stateBase);
+                val = matchWidth(val, sig.width);
+
+                auto* fn = builder_.GetInsertBlock()->getParent();
+                auto* thenBB = llvm::BasicBlock::Create(ctx_, "cstore_n", fn);
+                auto* elseBB = llvm::BasicBlock::Create(ctx_, "celse_n", fn);
+                builder_.CreateCondBr(cond, thenBB, elseBB);
+
+                builder_.SetInsertPoint(thenBB);
+                storeSignal(nextState, sig, val);
+                builder_.CreateBr(mergeBB);
+
+                builder_.SetInsertPoint(elseBB);
+                emitConditionalStoreInner(nextState, stateBase, targetIdx,
+                                          falseBranch, mergeBB);
+                return;
+            }
+        }
+        // Fallback: unconditional store
+        auto* val = emitExpr(expr, stateBase);
+        val = matchWidth(val, sig.width);
+        storeSignal(nextState, sig, val);
+        builder_.CreateBr(mergeBB);
+    }
+
     // ── Code generation ─────────────────────────────────────────────────
 
     /// Emit the eval body (SSA signal promotion) at the current insert point.
@@ -209,11 +385,16 @@ private:
         for (auto& proc : mod_.processes) {
             if (proc.kind != ir::Process::Sequential) continue;
             for (auto& assign : proc.assignments) {
-                auto* val = emitExpr(assign.value, state);
-                if (assign.indexExpr)
+                if (assign.indexExpr) {
+                    auto* val = emitExpr(assign.value, state);
                     emitArrayStore(nextState, state, assign, val);
-                else
+                } else if (preCopied_ && isNestedIdentityMux(assign.value, assign.targetIndex)) {
+                    // Identity mux: pre-copy handles the default case
+                    emitConditionalStore(nextState, state, assign);
+                } else {
+                    auto* val = emitExpr(assign.value, state);
                     storeSignal(nextState, mod_.signals[assign.targetIndex], val);
+                }
             }
         }
     }
@@ -280,12 +461,31 @@ private:
         auto* skipLoop = builder_.CreateICmpEQ(cycles, zero);
         builder_.CreateCondBr(skipLoop, exit, loop);
 
-        // Loop body: eval + commitFFs + increment
+        // Loop body: pre-copy + eval + commitFFs + increment
         builder_.SetInsertPoint(loop);
         auto* i = builder_.CreatePHI(i64Ty, 2, "i");
         i->addIncoming(zero, entry);
 
+        // Pre-copy FF regions state→nextState when identity muxes are present.
+        // This enables identity-mux elimination (skip stores where value doesn't change).
+        // Only worthwhile when there are enough identity muxes to offset the copy cost.
+        if (identityMuxCount_ >= 4) {
+            // Copy only FF regions (not full state) to minimize overhead
+            auto* i8Ty = llvm::Type::getInt8Ty(ctx_);
+            auto* i32Ty_ = llvm::Type::getInt32Ty(ctx_);
+            for (auto& r : ffRegions_) {
+                auto* src = builder_.CreateGEP(i8Ty, state,
+                    llvm::ConstantInt::get(i32Ty_, r.offset));
+                auto* dst = builder_.CreateGEP(i8Ty, nextState,
+                    llvm::ConstantInt::get(i32Ty_, r.offset));
+                builder_.CreateMemCpy(dst, llvm::MaybeAlign(1), src,
+                                      llvm::MaybeAlign(1), r.bytes);
+            }
+            preCopied_ = true;
+        }
+
         emitEvalBody(state, nextState);
+        preCopied_ = false;
         emitCommitFFs(state, nextState);
 
         auto* iNext = builder_.CreateAdd(i, llvm::ConstantInt::get(i64Ty, 1));
