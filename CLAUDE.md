@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 12 complete.** Block value tracking, logical NOT fix, concat LHS, inc/dec ops, CRC-32 benchmark.
+**Sprint 13 complete.** Multi-file, while/repeat loops, local variables, case/wildcard equality, SPI benchmark.
 
 Next priorities:
-1. **While/repeat loops**: Procedural loops beyond for-loops.
-2. **Struct types**: Packed structs with field access.
-3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-4. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+1. **Struct types**: Packed structs with field access.
+2. **Performance: reduce redundant assignments from block value tracking**.
+3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+4. **Memory (2D arrays)**: Larger memories, block RAM modeling.
 
 ### Project Structure
 ```
@@ -43,7 +43,9 @@ surge/
     barrel_shifter.sv
     fifo.sv
     crc32.sv
+    spi_master.sv
     param_adder.sv
+    multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
     enum_fsm.sv
   bench/
@@ -275,6 +277,25 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | Barrel Shifter | **139 MHz** | — | — | PASS |
 | FIFO (8x32) | **88 MHz** | — | — | PASS |
 | CRC-32 | **58 MHz** | — | — | PASS |
+
+### Sprint 13: Multi-File, While Loops, Local Variables, SPI Master (complete)
+- **Multi-file support**: Multiple `.sv` files on command line, each parsed and added to the same slang Compilation. Enables separate sub-module files.
+- **While/do-while/repeat loops**: Compile-time unrolling with constant condition evaluation. Bounded by MAX_UNROLL=1024.
+- **Local variable declarations**: `VariableDeclStatement` in procedural blocks now creates internal signals with initializer support. Enables local temporaries in `always_comb`.
+- **Case/wildcard equality**: `===`, `!==`, `==?`, `!=?` mapped to `==`/`!=` (correct in 2-state simulation).
+- **Empty statement handling**: `StatementKind::Empty` no longer triggers unsupported warning.
+- New tests: `spi_master.sv` — SPI FSM with shift register, bit counting via `$countones`, enum states, case equality. `multi_file/` — multi-file hierarchy test. Both verified against Verilator.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **260 MHz** | 23 MHz | **11.3x** | PASS |
+| ALU+Regfile | **126 MHz** | 33 MHz | **3.8x** | PASS |
+| RISC-V 5-Stage | **66 MHz** | 15 MHz | **4.4x** | PASS |
+| Barrel Shifter | **131 MHz** | — | — | PASS |
+| FIFO (8x32) | **82 MHz** | — | — | PASS |
+| CRC-32 | **46 MHz** | — | — | PASS |
+| SPI Master | **129 MHz** | — | — | PASS |
 
 ## Research
 

@@ -283,6 +283,10 @@ private:
             case slang::ast::BinaryOperator::BinaryXor:     op = BinaryOp::Xor; break;
             case slang::ast::BinaryOperator::Equality:      op = BinaryOp::Eq; break;
             case slang::ast::BinaryOperator::Inequality:    op = BinaryOp::Neq; break;
+            case slang::ast::BinaryOperator::CaseEquality:  op = BinaryOp::Eq; break;
+            case slang::ast::BinaryOperator::CaseInequality: op = BinaryOp::Neq; break;
+            case slang::ast::BinaryOperator::WildcardEquality: op = BinaryOp::Eq; break;
+            case slang::ast::BinaryOperator::WildcardInequality: op = BinaryOp::Neq; break;
             case slang::ast::BinaryOperator::LessThan:      op = BinaryOp::Lt; break;
             case slang::ast::BinaryOperator::LessThanEqual: op = BinaryOp::Lte; break;
             case slang::ast::BinaryOperator::GreaterThan:   op = BinaryOp::Gt; break;
@@ -666,8 +670,19 @@ public:
             case slang::ast::StatementKind::ForLoop:
                 lowerForLoop(stmt.as<slang::ast::ForLoopStatement>());
                 break;
+            case slang::ast::StatementKind::WhileLoop:
+                lowerWhileLoop(stmt.as<slang::ast::WhileLoopStatement>());
+                break;
+            case slang::ast::StatementKind::DoWhileLoop:
+                lowerDoWhileLoop(stmt.as<slang::ast::DoWhileLoopStatement>());
+                break;
+            case slang::ast::StatementKind::RepeatLoop:
+                lowerRepeatLoop(stmt.as<slang::ast::RepeatLoopStatement>());
+                break;
             case slang::ast::StatementKind::VariableDeclaration:
-                // Skip variable declarations (e.g., loop variable `int i`)
+                lowerVarDecl(stmt.as<slang::ast::VariableDeclStatement>());
+                break;
+            case slang::ast::StatementKind::Empty:
                 break;
             default:
                 std::cerr << "surge: unsupported statement kind "
@@ -684,6 +699,26 @@ private:
     const SymbolMap& symbolMap_;
     bool trackBlockValues_;
     std::vector<Assignment> assignments_;
+
+    void lowerVarDecl(const slang::ast::VariableDeclStatement& vds) {
+        auto& var = vds.symbol;
+        // Skip if already mapped (e.g., loop variable `int i`)
+        if (symbolMap_.count(&var)) return;
+
+        // Create an internal signal for this local variable
+        uint32_t w = getTypeWidth(var.getType());
+        uint32_t idx = mod_.addSignal(std::string(var.name), w, SignalKind::Internal);
+        // Use const_cast to update the shared symbolMap (local vars need to be resolvable)
+        const_cast<SymbolMap&>(symbolMap_)[&var] = idx;
+
+        // Handle initializer if present
+        if (auto* init = var.getInitializer()) {
+            auto val = el_.lower(*init);
+            assignments_.push_back({idx, val});
+            if (trackBlockValues_)
+                el_.setBlockValue(idx, val);
+        }
+    }
 
     void lowerExprStmt(const slang::ast::ExpressionStatement& es) {
         auto& expr = es.expr;
@@ -962,6 +997,53 @@ private:
             std::cerr << "surge: for loop unroll limit reached (" << MAX_UNROLL << ")\n";
     }
 
+    // Attempt to evaluate a boolean expression at compile time using loop variable values.
+    // Returns true if condition is true, false otherwise. Only handles simple patterns.
+    bool evaluateCondition(const slang::ast::Expression& condExpr) {
+        auto cv = condExpr.getConstant();
+        if (cv && cv->isInteger()) {
+            auto val = cv->integer().as<uint64_t>();
+            return val.has_value() && *val != 0;
+        }
+        // Try lowering and checking if it's a compile-time constant
+        auto expr = el_.lower(condExpr);
+        if (expr->kind == ExprKind::Constant)
+            return expr->constVal != 0;
+        return false;
+    }
+
+    void lowerWhileLoop(const slang::ast::WhileLoopStatement& wl) {
+        const uint32_t MAX_UNROLL = 1024;
+        for (uint32_t iter = 0; iter < MAX_UNROLL; iter++) {
+            if (!evaluateCondition(wl.cond))
+                break;
+            lower(wl.body);
+        }
+    }
+
+    void lowerDoWhileLoop(const slang::ast::DoWhileLoopStatement& dwl) {
+        const uint32_t MAX_UNROLL = 1024;
+        for (uint32_t iter = 0; iter < MAX_UNROLL; iter++) {
+            lower(dwl.body);
+            if (!evaluateCondition(dwl.cond))
+                break;
+        }
+    }
+
+    void lowerRepeatLoop(const slang::ast::RepeatLoopStatement& rl) {
+        auto count = extractConstantInt(rl.count);
+        if (!count) {
+            std::cerr << "surge: repeat loop with non-constant count\n";
+            return;
+        }
+        const uint32_t MAX_UNROLL = 1024;
+        uint64_t n = std::min(*count, static_cast<uint64_t>(MAX_UNROLL));
+        for (uint64_t i = 0; i < n; i++)
+            lower(rl.body);
+        if (*count > MAX_UNROLL)
+            std::cerr << "surge: repeat loop count truncated to " << MAX_UNROLL << "\n";
+    }
+
     // Partition array-store assignments from scalar assignments
     static std::vector<Assignment> extractArrayStores(std::vector<Assignment>& assigns) {
         std::vector<Assignment> arrayStores;
@@ -1149,14 +1231,20 @@ private:
 // ── Public API ──────────────────────────────────────────────────────────────
 
 std::unique_ptr<Module> buildFromFile(const std::string& path) {
-    auto tree = slang::syntax::SyntaxTree::fromFile(path);
-    if (!tree) {
-        std::cerr << "surge: failed to parse '" << path << "'\n";
-        return nullptr;
-    }
+    return buildFromFiles({path});
+}
 
+std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
     slang::ast::Compilation compilation;
-    compilation.addSyntaxTree(tree.value());
+
+    for (auto& path : paths) {
+        auto tree = slang::syntax::SyntaxTree::fromFile(path);
+        if (!tree) {
+            std::cerr << "surge: failed to parse '" << path << "'\n";
+            return nullptr;
+        }
+        compilation.addSyntaxTree(tree.value());
+    }
 
     auto diags = compilation.getAllDiagnostics();
     if (!diags.empty()) {

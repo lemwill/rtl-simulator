@@ -4,10 +4,11 @@
 
 #include <iostream>
 #include <string>
+#include <vector>
 
 static void usage(const char* prog) {
     std::cerr << "Surge RTL Simulator v0.1\n\n"
-              << "Usage: " << prog << " <file.sv> [options]\n\n"
+              << "Usage: " << prog << " <file.sv> [file2.sv ...] [options]\n\n"
               << "Options:\n"
               << "  --cycles N    Number of simulation cycles (default: 100)\n"
               << "  --vcd FILE    Write VCD waveform to FILE\n"
@@ -22,7 +23,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string svFile;
+    std::vector<std::string> svFiles;
     surge::sim::SimConfig cfg;
     bool noOpt = false;
 
@@ -45,14 +46,14 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--no-opt") {
             noOpt = true;
         } else if (arg[0] != '-') {
-            svFile = arg;
+            svFiles.push_back(arg);
         } else {
             std::cerr << "surge: unknown option '" << arg << "'\n";
             return 1;
         }
     }
 
-    if (svFile.empty()) {
+    if (svFiles.empty()) {
         std::cerr << "surge: no input file\n";
         return 1;
     }
@@ -60,7 +61,7 @@ int main(int argc, char* argv[]) {
     // ── Pipeline: Parse → IR → Codegen → Simulate ──
 
     // 1. Parse SV and build IR
-    auto mod = surge::ir::buildFromFile(svFile);
+    auto mod = surge::ir::buildFromFiles(svFiles);
     if (!mod) return 1;
 
     // 1b. Dead signal elimination
