@@ -97,6 +97,18 @@ public:
         loopVarValues_.erase(sym);
     }
 
+    // Block-local value tracking: when a signal is assigned in a procedural
+    // block, subsequent reads should use the assigned expression (not re-read
+    // the signal). This enables for-loop accumulation patterns.
+    void setBlockValue(uint32_t signalIdx, ExprPtr val) {
+        blockValues_[signalIdx] = val;
+    }
+    void clearBlockValues() { blockValues_.clear(); }
+    std::unordered_map<uint32_t, ExprPtr> saveBlockValues() const { return blockValues_; }
+    void restoreBlockValues(const std::unordered_map<uint32_t, ExprPtr>& saved) {
+        blockValues_ = saved;
+    }
+
     ExprPtr lower(const slang::ast::Expression& expr) {
         switch (expr.kind) {
             case slang::ast::ExpressionKind::IntegerLiteral:
@@ -143,6 +155,7 @@ private:
     const ArrayMap& arrayMap_;
     const SymbolMap& symbolMap_;
     std::unordered_map<const slang::ast::Symbol*, uint64_t> loopVarValues_;
+    std::unordered_map<uint32_t, ExprPtr> blockValues_;
 
     ExprPtr lowerIntLiteral(const slang::ast::IntegerLiteral& lit) {
         auto val = lit.getValue();
@@ -195,6 +208,10 @@ private:
         // Symbol-based resolution (supports hierarchical inlining)
         auto symIt = symbolMap_.find(&sym);
         if (symIt != symbolMap_.end()) {
+            // Check block-local value override first
+            auto bvIt = blockValues_.find(symIt->second);
+            if (bvIt != blockValues_.end())
+                return bvIt->second;
             auto& sig = mod_.signals[symIt->second];
             return Expr::signalRef(sig.width, sig.index);
         }
@@ -205,6 +222,10 @@ private:
             std::cerr << "surge: unknown signal '" << sym.name << "'\n";
             return Expr::constant(1, 0);
         }
+        // Check block-local value override
+        auto bvIt = blockValues_.find(sig->index);
+        if (bvIt != blockValues_.end())
+            return bvIt->second;
         return Expr::signalRef(sig->width, sig->index);
     }
 
@@ -214,9 +235,20 @@ private:
         UnaryOp op;
         switch (ue.op) {
             case slang::ast::UnaryOperator::BitwiseNot: op = UnaryOp::Not; break;
-            case slang::ast::UnaryOperator::LogicalNot: op = UnaryOp::Not; break;
+            case slang::ast::UnaryOperator::LogicalNot: {
+                // Logical NOT: result is 1 if operand == 0, else 0
+                uint32_t opWidth = getTypeWidth(*ue.operand().type);
+                return Expr::binary(BinaryOp::Eq, w, operand,
+                    Expr::constant(opWidth, 0));
+            }
             case slang::ast::UnaryOperator::Minus:      op = UnaryOp::Negate; break;
             case slang::ast::UnaryOperator::Plus:       return operand;
+            case slang::ast::UnaryOperator::Preincrement:
+            case slang::ast::UnaryOperator::Postincrement:
+                return Expr::binary(BinaryOp::Add, w, operand, Expr::constant(w, 1));
+            case slang::ast::UnaryOperator::Predecrement:
+            case slang::ast::UnaryOperator::Postdecrement:
+                return Expr::binary(BinaryOp::Sub, w, operand, Expr::constant(w, 1));
             case slang::ast::UnaryOperator::BitwiseAnd: op = UnaryOp::ReduceAnd; break;
             case slang::ast::UnaryOperator::BitwiseOr:  op = UnaryOp::ReduceOr; break;
             case slang::ast::UnaryOperator::BitwiseXor: op = UnaryOp::ReduceXor; break;
@@ -375,7 +407,7 @@ private:
                 return Expr::constant(1, 0);
             }
 
-            // $clog2, $bits — try compile-time constant evaluation
+            // $clog2, $bits, $size — try compile-time constant evaluation
             if (auto* cv = call.getConstant()) {
                 if (cv->isInteger()) {
                     uint64_t v = 0;
@@ -605,8 +637,10 @@ bool evaluateStopCondition(const slang::ast::Expression& stopExpr,
 
 class StmtLowering {
 public:
-    StmtLowering(Module& mod, ExprLowering& el, const SymbolMap& symbolMap)
-        : mod_(mod), el_(el), symbolMap_(symbolMap) {}
+    StmtLowering(Module& mod, ExprLowering& el, const SymbolMap& symbolMap,
+                 bool trackBlockValues = false)
+        : mod_(mod), el_(el), symbolMap_(symbolMap),
+          trackBlockValues_(trackBlockValues) {}
 
     void lower(const slang::ast::Statement& stmt) {
         switch (stmt.kind) {
@@ -648,6 +682,7 @@ private:
     Module& mod_;
     ExprLowering& el_;
     const SymbolMap& symbolMap_;
+    bool trackBlockValues_;
     std::vector<Assignment> assignments_;
 
     void lowerExprStmt(const slang::ast::ExpressionStatement& es) {
@@ -678,10 +713,16 @@ private:
                 return;
             }
             assignments_.push_back({sigIdx, rhs});
+            // Update block-local value so subsequent reads see this assignment
+            // (only for blocking-assignment semantics: always_comb, always_latch)
+            if (trackBlockValues_)
+                el_.setBlockValue(sigIdx, rhs);
         } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
             lowerIndexedAssignment(lhs.as<slang::ast::ElementSelectExpression>(), rhs);
         } else if (lhs.kind == slang::ast::ExpressionKind::RangeSelect) {
             lowerRangeAssignment(lhs.as<slang::ast::RangeSelectExpression>(), rhs);
+        } else if (lhs.kind == slang::ast::ExpressionKind::Concatenation) {
+            lowerConcatAssignment(lhs.as<slang::ast::ConcatenationExpression>(), rhs);
         } else {
             std::cerr << "surge: unsupported LHS kind "
                       << static_cast<int>(lhs.kind) << " in assignment\n";
@@ -840,6 +881,27 @@ private:
         assignments_.push_back({sigIdx, result});
     }
 
+    void lowerConcatAssignment(const slang::ast::ConcatenationExpression& cc, ExprPtr rhs) {
+        // {a, b, c} = rhs — split RHS into slices for each target
+        std::vector<std::pair<const slang::ast::Expression*, uint32_t>> targets;
+        for (auto* op : cc.operands())
+            targets.push_back({op, getTypeWidth(*op->type)});
+
+        // Concat is MSB-first: targets[0] is highest bits
+        uint32_t bitPos = 0;
+        for (int i = static_cast<int>(targets.size()) - 1; i >= 0; i--) {
+            auto [tExpr, tWidth] = targets[i];
+            auto sliced = Expr::slice(tWidth, rhs, bitPos + tWidth - 1, bitPos);
+            if (tExpr->kind == slang::ast::ExpressionKind::NamedValue) {
+                auto& nv = tExpr->as<slang::ast::NamedValueExpression>();
+                uint32_t sigIdx = resolveSignalIndex(nv.symbol);
+                if (sigIdx != UINT32_MAX)
+                    assignments_.push_back({sigIdx, sliced});
+            }
+            bitPos += tWidth;
+        }
+    }
+
     void lowerForLoop(const slang::ast::ForLoopStatement& fl) {
         const slang::ast::Symbol* loopVar = nullptr;
         uint64_t currentVal = 0;
@@ -922,16 +984,24 @@ private:
         else
             cond = Expr::constant(1, 1);
 
-        StmtLowering ifLower(mod_, el_, symbolMap_);
+        // Save block values before branching (branches are alternatives)
+        auto savedBlockValues = el_.saveBlockValues();
+
+        StmtLowering ifLower(mod_, el_, symbolMap_, trackBlockValues_);
         ifLower.lower(cs.ifTrue);
         auto ifAssigns = std::move(ifLower.assignments());
 
         std::vector<Assignment> elseAssigns;
         if (cs.ifFalse) {
-            StmtLowering elseLower(mod_, el_, symbolMap_);
+            // Restore to pre-branch state for else branch
+            el_.restoreBlockValues(savedBlockValues);
+            StmtLowering elseLower(mod_, el_, symbolMap_, trackBlockValues_);
             elseLower.lower(*cs.ifFalse);
             elseAssigns = std::move(elseLower.assignments());
         }
+
+        // Restore to pre-branch state; muxed results will be set below
+        el_.restoreBlockValues(savedBlockValues);
 
         // Separate array stores from scalar assignments before merging
         auto ifArrayStores = extractArrayStores(ifAssigns);
@@ -953,6 +1023,8 @@ private:
             auto muxed = Expr::mux(mod_.signals[ifA.targetIndex].width,
                                    cond, ifA.value, falseVal);
             assignments_.push_back({ifA.targetIndex, muxed});
+            if (trackBlockValues_)
+                el_.setBlockValue(ifA.targetIndex, muxed);
         }
 
         for (auto& elseA : elseAssigns) {
@@ -965,6 +1037,8 @@ private:
                 auto trueVal = Expr::signalRef(sig.width, sig.index);
                 auto muxed = Expr::mux(sig.width, cond, trueVal, elseA.value);
                 assignments_.push_back({elseA.targetIndex, muxed});
+                if (trackBlockValues_)
+                    el_.setBlockValue(elseA.targetIndex, muxed);
             }
         }
 
@@ -994,12 +1068,14 @@ private:
 
     void lowerCase(const slang::ast::CaseStatement& cs) {
         auto selectorExpr = el_.lower(cs.expr);
+        auto savedBlockValues = el_.saveBlockValues();
 
         // Collect default assignments (scalar only; array stores handled separately)
         std::unordered_map<uint32_t, ExprPtr> currentValues;
         std::vector<Assignment> arrayStoreAccum; // accumulated array stores with conditions
         if (cs.defaultCase) {
-            StmtLowering defaultLower(mod_, el_, symbolMap_);
+            el_.restoreBlockValues(savedBlockValues);
+            StmtLowering defaultLower(mod_, el_, symbolMap_, trackBlockValues_);
             defaultLower.lower(*cs.defaultCase);
             auto defaultAssigns = std::move(defaultLower.assignments());
             auto defaultArrayStores = extractArrayStores(defaultAssigns);
@@ -1014,7 +1090,8 @@ private:
         for (int i = static_cast<int>(cs.items.size()) - 1; i >= 0; i--) {
             auto& item = cs.items[i];
 
-            StmtLowering itemLower(mod_, el_, symbolMap_);
+            el_.restoreBlockValues(savedBlockValues);
+            StmtLowering itemLower(mod_, el_, symbolMap_, trackBlockValues_);
             itemLower.lower(*item.stmt);
             auto itemAssigns = std::move(itemLower.assignments());
             auto itemArrayStores = extractArrayStores(itemAssigns);
@@ -1056,8 +1133,12 @@ private:
             }
         }
 
-        for (auto& [targetIdx, val] : currentValues)
+        el_.restoreBlockValues(savedBlockValues);
+        for (auto& [targetIdx, val] : currentValues) {
             assignments_.push_back({targetIdx, val});
+            if (trackBlockValues_)
+                el_.setBlockValue(targetIdx, val);
+        }
         for (auto& as : arrayStoreAccum)
             assignments_.push_back(std::move(as));
     }
@@ -1327,9 +1408,12 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
                     proc.kind = Process::Combinational;
                 }
 
-                StmtLowering stmtLower(*mod, exprLower, symbolMap);
+                exprLower.clearBlockValues();
+                bool isBlocking = (proc.kind == Process::Combinational);
+                StmtLowering stmtLower(*mod, exprLower, symbolMap, isBlocking);
                 stmtLower.lower(pb.getBody());
                 proc.assignments = std::move(stmtLower.assignments());
+                exprLower.clearBlockValues();
 
                 if (proc.kind == Process::Sequential) {
                     for (auto& a : proc.assignments) {

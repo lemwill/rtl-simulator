@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 11 complete.** System functions, dead signal elimination, parameterized FIFO.
+**Sprint 12 complete.** Block value tracking, logical NOT fix, concat LHS, inc/dec ops, CRC-32 benchmark.
 
 Next priorities:
-1. **While loops / do-while**: Procedural loops (not just for).
-2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-4. **Wider test coverage**: More complex SV patterns (always_latch, tri-state, etc.)
+1. **While/repeat loops**: Procedural loops beyond for-loops.
+2. **Struct types**: Packed structs with field access.
+3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+4. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
 
 ### Project Structure
 ```
@@ -42,6 +42,7 @@ surge/
     riscv_pipeline.sv
     barrel_shifter.sv
     fifo.sv
+    crc32.sv
     param_adder.sv
     generate_chain.sv
     enum_fsm.sv
@@ -257,6 +258,23 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
 | Barrel Shifter | **138 MHz** | — | — | PASS |
 | FIFO (8x32) | **87 MHz** | — | — | PASS |
+
+### Sprint 12: Block Value Tracking + Bugfixes + CRC-32 (complete)
+- **Block value tracking for always_comb**: Procedural blocking assignments now propagate values within the same block. Reads after writes in `always_comb` see the updated expression, enabling for-loop accumulation patterns (CRC, scan chains). Save/restore around if/else and case branches for correct conditional semantics.
+- **Bugfix: logical NOT on multi-bit signals**: `!x` now correctly lowered as `(x == 0)` instead of bitwise invert `~x`. Previously gave wrong results for any multi-bit operand.
+- **Concatenation LHS in procedural blocks**: `{a, b} <= expr` now works in `always_ff`/`always_comb` blocks, not just continuous assigns.
+- **Pre/post increment/decrement operators**: `i++`, `++i`, `i--`, `--i` lowered as add/subtract by 1.
+- New test: `crc32.sv` — CRC-32 with Ethernet polynomial, 8-bit byte processing per cycle, LFSR self-stimulus, checksum accumulator. Exercises always_comb for-loop accumulation. Verified cycle-accurate against Verilator.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **262 MHz** | 23 MHz | **11.4x** | PASS |
+| ALU+Regfile | **126 MHz** | 33 MHz | **3.8x** | PASS |
+| RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
+| Barrel Shifter | **139 MHz** | — | — | PASS |
+| FIFO (8x32) | **88 MHz** | — | — | PASS |
+| CRC-32 | **58 MHz** | — | — | PASS |
 
 ## Research
 
