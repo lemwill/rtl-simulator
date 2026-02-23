@@ -12,6 +12,12 @@ Runtime::Runtime(const ir::Module& mod, codegen::EvalFn evalFn,
 {
     state_.resize(mod.stateSize, 0);
     nextState_.resize(mod.stateSize, 0);
+
+    // Apply initial values from initial blocks
+    for (auto& [sigIdx, val] : mod.initialValues) {
+        writeSignal(sigIdx, val);
+    }
+
     buildFFRegions();
 
     if (!cfg_.vcdPath.empty()) {
