@@ -151,6 +151,8 @@ public:
             case slang::ast::ExpressionKind::StructuredAssignmentPattern:
             case slang::ast::ExpressionKind::ReplicatedAssignmentPattern:
                 return lowerAssignmentPattern(expr);
+            case slang::ast::ExpressionKind::Inside:
+                return lowerInside(expr.as<slang::ast::InsideExpression>());
             default:
                 std::cerr << "surge: unsupported expression kind "
                           << static_cast<int>(expr.kind) << "\n";
@@ -508,6 +510,33 @@ private:
         for (auto* e : elems)
             parts.push_back(lower(*e));
         return Expr::concat(totalWidth, std::move(parts));
+    }
+
+    ExprPtr lowerInside(const slang::ast::InsideExpression& ie) {
+        // inside operator: val inside {a, b, [lo:hi], ...}
+        // Lowers to: (val == a) || (val == b) || (val >= lo && val <= hi) || ...
+        auto lhs = lower(ie.left());
+        uint32_t lhsWidth = getTypeWidth(*ie.left().type);
+        ExprPtr result;
+        for (auto* rangeExpr : ie.rangeList()) {
+            ExprPtr match;
+            if (rangeExpr->kind == slang::ast::ExpressionKind::ValueRange) {
+                auto& vr = rangeExpr->as<slang::ast::ValueRangeExpression>();
+                auto lo = lower(vr.left());
+                auto hi = lower(vr.right());
+                auto geq = Expr::binary(BinaryOp::Gte, 1, lhs, lo);
+                auto leq = Expr::binary(BinaryOp::Lte, 1, lhs, hi);
+                match = Expr::binary(BinaryOp::And, 1, geq, leq);
+            } else {
+                auto rhs = lower(*rangeExpr);
+                match = Expr::binary(BinaryOp::Eq, 1, lhs, rhs);
+            }
+            if (!result)
+                result = match;
+            else
+                result = Expr::binary(BinaryOp::Or, 1, result, match);
+        }
+        return result ? result : Expr::constant(1, 0);
     }
 
     ExprPtr lowerElementSelect(const slang::ast::ElementSelectExpression& es) {

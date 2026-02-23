@@ -2,7 +2,7 @@
 
 ## What To Do Next
 
-**Sprint 18 complete.** Conditional re-assignment bugfix, UART TX test.
+**Sprint 19 complete.** `inside` operator support.
 
 Next priorities:
 1. **Task output arguments**: Support tasks with `output` port bindings.
@@ -338,6 +338,10 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 - **Critical bugfix: conditional re-assignment**: `signal <= default; if (cond) signal <= override;` patterns in sequential blocks now work correctly. Previously the conditional override was lost — the mux false-branch used `signalRef(target)` (reads current state) instead of the pending outer assignment value (the default). Fixed in both `lowerConditional` and `lowerCase`: when merging, search for pending outer assignments and use their value as the mux fallback. Also replace-in-place instead of duplicating.
 - This pattern is ubiquitous in real RTL: default output assignments at the top of always_ff blocks with conditional overrides inside case/if.
 - New test: `uart_tx.sv` — parameterized UART transmitter with FSM (IDLE/START/DATA/STOP/DONE), shift register, bit counter, self-stimulus top-level. Exercises: hierarchy, enum typedef, parameterized submodule, conditional re-assignment, `$clog2` in parameter context. Verified cycle-accurate against Verilator.
+
+### Sprint 19: `inside` Operator (complete)
+- **`inside` operator**: `InsideExpression` lowered as chain of equality/range checks ORed together. Each `ValueRangeExpression` element becomes `(val >= lo && val <= hi)`, each scalar element becomes `(val == elem)`. Enables pattern matching in decode logic.
+- Verified cycle-accurate against Verilator: both discrete values and ranges (`[lo:hi]`) work correctly.
 
 ## Research
 
