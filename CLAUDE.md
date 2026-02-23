@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 15 complete.** Packed struct support with field read (bit slice) and write (chained read-modify-write).
+**Sprint 16 complete.** User-defined function inlining, foreach loops, system task silencing, break/continue, return statements.
 
 Next priorities:
 1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
 2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-3. **Wider test coverage**: More complex SV patterns, larger benchmarks.
-4. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
+3. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
+4. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
 
 ### Project Structure
 ```
@@ -45,6 +45,7 @@ surge/
     crc32.sv
     spi_master.sv
     struct_test.sv
+    func_test.sv
     param_adder.sv
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
@@ -315,6 +316,15 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 - **Packed struct field read (RHS)**: `MemberAccessExpression` on packed structs lowered as bit slice using `FieldSymbol.bitOffset`. `pt.x` → `Expr::slice(fieldWidth, src, hi, lo)`.
 - **Packed struct field write (LHS)**: Read-modify-write pattern: `sig = (sig & ~(mask << offset)) | ((val & mask) << offset)`. Multiple field writes to the same struct signal are **chained** — the second RMW uses the first RMW's result as the base, not the original signal. Produces a single merged assignment instead of conflicting overwrites.
 - New test: `struct_test.sv` — packed struct with two 16-bit fields, field read/write in always_ff. Verified cycle-accurate against Verilator.
+
+### Sprint 16: Functions, Foreach, System Tasks (complete)
+- **User-defined function inlining**: `CallExpression` targeting `SubroutineSymbol` inlined at call site. Function arguments mapped via block values, body lowered with `StmtLowering`, return value extracted from block values. Supports pure functions with conditional returns, local variables, and for-loop accumulation inside function bodies.
+- **Foreach loops**: `ForeachLoopStatement` unrolled over static array dimension ranges. Loop variable set as compile-time constant per iteration.
+- **Return statement**: `ReturnStatement` handled as assignment to return variable + break. `returnTargetIdx_` propagated through sub-StmtLowerings in conditional and case branches.
+- **Break/continue**: `breakHit_`/`continueHit_` flags in StmtLowering, checked after each loop iteration and in statement lists.
+- **System task silencing**: `$display`, `$write`, `$strobe`, `$monitor`, `$finish`, `$stop`, `$info`, `$warning`, `$error`, `$fatal`, `$time`, `$realtime` silently ignored (no-op in synthesis-oriented sim). Also handles `CallExpression` in `ExpressionStatement`.
+- **Bugfix: one-armed if with block values**: When `trackBlockValues_` is true and there's no else-branch, the false path now uses the pre-branch block value instead of `SignalRef(target)`. Fixes for-loop accumulation with conditional increment (e.g., popcount).
+- New test: `func_test.sv` — functions with conditional return, for-loop accumulation (popcount), foreach array init, arithmetic functions. Verified cycle-accurate against Verilator.
 
 ## Research
 

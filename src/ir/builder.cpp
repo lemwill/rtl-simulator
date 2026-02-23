@@ -21,6 +21,7 @@
 #include <slang/ast/symbols/MemberSymbols.h>
 #include <slang/ast/symbols/PortSymbols.h>
 #include <slang/ast/symbols/ParameterSymbols.h>
+#include <slang/ast/symbols/SubroutineSymbols.h>
 #include <slang/ast/symbols/VariableSymbols.h>
 #include <slang/ast/types/AllTypes.h>
 #include <slang/diagnostics/DiagnosticEngine.h>
@@ -82,6 +83,9 @@ getUnpackedArrayInfo(const slang::ast::Type& type) {
     }
     return std::nullopt;
 }
+
+// Forward declaration
+class StmtLowering;
 
 // ── Expression lowering ─────────────────────────────────────────────────────
 
@@ -151,6 +155,10 @@ public:
     }
 
     const ArrayMap& arrayMap() const { return arrayMap_; }
+    SymbolMap& symbolMapMut() { return const_cast<SymbolMap&>(symbolMap_); }
+
+    // Inline a user-defined function call. Returns the expression for the return value.
+    ExprPtr lowerUserFunction(const slang::ast::CallExpression& call);
 
 private:
     Module& mod_;
@@ -158,6 +166,7 @@ private:
     const SymbolMap& symbolMap_;
     std::unordered_map<const slang::ast::Symbol*, uint64_t> loopVarValues_;
     std::unordered_map<uint32_t, ExprPtr> blockValues_;
+    uint32_t inlineCounter_ = 0; // unique counter for function argument signals
 
     ExprPtr lowerIntLiteral(const slang::ast::IntegerLiteral& lit) {
         auto val = lit.getValue();
@@ -422,9 +431,22 @@ private:
                     return Expr::constant(getTypeWidth(*call.type), v);
                 }
             }
+            // System tasks ($display, $write, etc.) — silently ignore
+            if (name == "$display" || name == "$write" || name == "$strobe" ||
+                name == "$monitor" || name == "$sformatf" || name == "$sformat" ||
+                name == "$fwrite" || name == "$fdisplay" || name == "$info" ||
+                name == "$warning" || name == "$error" || name == "$fatal" ||
+                name == "$time" || name == "$realtime" || name == "$finish" ||
+                name == "$stop") {
+                return Expr::constant(getTypeWidth(*call.type), 0);
+            }
+
+            std::cerr << "surge: unsupported system call: " << name << "\n";
+            return Expr::constant(getTypeWidth(*call.type), 0);
         }
-        std::cerr << "surge: unsupported call: " << call.getSubroutineName() << "\n";
-        return Expr::constant(getTypeWidth(*call.type), 0);
+
+        // User-defined function call — inline at call site
+        return lowerUserFunction(call);
     }
 
     ExprPtr lowerMemberAccess(const slang::ast::MemberAccessExpression& ma) {
@@ -698,6 +720,18 @@ public:
             case slang::ast::StatementKind::RepeatLoop:
                 lowerRepeatLoop(stmt.as<slang::ast::RepeatLoopStatement>());
                 break;
+            case slang::ast::StatementKind::ForeachLoop:
+                lowerForeachLoop(stmt.as<slang::ast::ForeachLoopStatement>());
+                break;
+            case slang::ast::StatementKind::Return:
+                lowerReturn(stmt.as<slang::ast::ReturnStatement>());
+                break;
+            case slang::ast::StatementKind::Break:
+                breakHit_ = true;
+                break;
+            case slang::ast::StatementKind::Continue:
+                continueHit_ = true;
+                break;
             case slang::ast::StatementKind::VariableDeclaration:
                 lowerVarDecl(stmt.as<slang::ast::VariableDeclStatement>());
                 break;
@@ -711,12 +745,22 @@ public:
     }
 
     std::vector<Assignment>& assignments() { return assignments_; }
+    bool breakHit() const { return breakHit_; }
+    bool continueHit() const { return continueHit_; }
+    void clearBreak() { breakHit_ = false; }
+    void clearContinue() { continueHit_ = false; }
+
+    // For function inlining: set the return variable symbol index
+    void setReturnTarget(uint32_t sigIdx) { returnTargetIdx_ = sigIdx; }
 
 private:
     Module& mod_;
     ExprLowering& el_;
     const SymbolMap& symbolMap_;
     bool trackBlockValues_;
+    bool breakHit_ = false;
+    bool continueHit_ = false;
+    uint32_t returnTargetIdx_ = UINT32_MAX; // for function inlining
     std::vector<Assignment> assignments_;
 
     void lowerVarDecl(const slang::ast::VariableDeclStatement& vds) {
@@ -744,7 +788,12 @@ private:
         if (expr.kind == slang::ast::ExpressionKind::Assignment) {
             auto& assign = expr.as<slang::ast::AssignmentExpression>();
             lowerAssignment(assign);
+        } else if (expr.kind == slang::ast::ExpressionKind::Call) {
+            // System tasks ($display, etc.) or void function calls — lower as expression
+            // (system tasks return 0 and have no side effects in our model)
+            el_.lower(expr);
         }
+        // Other expression statements (e.g., increment) — silently skip
     }
 
     uint32_t resolveSignalIndex(const slang::ast::Symbol& sym) const {
@@ -1068,6 +1117,9 @@ private:
             el_.setLoopVarValue(loopVar, currentVal);
             lower(fl.body);
 
+            if (breakHit_) { breakHit_ = false; break; }
+            if (continueHit_) continueHit_ = false; // continue = skip rest, proceed
+
             currentVal = static_cast<uint64_t>(static_cast<int64_t>(currentVal) + stepIncrement);
         }
 
@@ -1124,6 +1176,48 @@ private:
             std::cerr << "surge: repeat loop count truncated to " << MAX_UNROLL << "\n";
     }
 
+    void lowerForeachLoop(const slang::ast::ForeachLoopStatement& fl) {
+        // Unroll foreach by iterating over each dimension's static range
+        // For now, support single-dimension foreach
+        if (fl.loopDims.empty()) return;
+
+        auto& dim = fl.loopDims[0];
+        if (!dim.range) {
+            std::cerr << "surge: foreach loop with dynamic range not supported\n";
+            return;
+        }
+
+        int32_t lo = dim.range->lower();
+        int32_t hi = dim.range->upper();
+        const slang::ast::Symbol* loopVar = dim.loopVar;
+
+        if (!loopVar) {
+            // Dimension is being skipped (foreach (arr[,j]) pattern)
+            return;
+        }
+
+        for (int32_t i = lo; i <= hi; i++) {
+            el_.setLoopVarValue(loopVar, static_cast<uint64_t>(i));
+            lower(fl.body);
+            if (breakHit_) { breakHit_ = false; break; }
+            if (continueHit_) continueHit_ = false;
+        }
+
+        el_.clearLoopVarValue(loopVar);
+    }
+
+    void lowerReturn(const slang::ast::ReturnStatement& rs) {
+        // Return statement in a function: assign expression to return variable
+        if (rs.expr && returnTargetIdx_ != UINT32_MAX) {
+            auto val = el_.lower(*rs.expr);
+            assignments_.push_back({returnTargetIdx_, val});
+            if (trackBlockValues_)
+                el_.setBlockValue(returnTargetIdx_, val);
+        }
+        // Signal that we should stop processing further statements
+        breakHit_ = true;
+    }
+
     // Partition array-store assignments from scalar assignments
     static std::vector<Assignment> extractArrayStores(std::vector<Assignment>& assigns) {
         std::vector<Assignment> arrayStores;
@@ -1150,6 +1244,7 @@ private:
         auto savedBlockValues = el_.saveBlockValues();
 
         StmtLowering ifLower(mod_, el_, symbolMap_, trackBlockValues_);
+        ifLower.setReturnTarget(returnTargetIdx_);
         ifLower.lower(cs.ifTrue);
         auto ifAssigns = std::move(ifLower.assignments());
 
@@ -1158,6 +1253,7 @@ private:
             // Restore to pre-branch state for else branch
             el_.restoreBlockValues(savedBlockValues);
             StmtLowering elseLower(mod_, el_, symbolMap_, trackBlockValues_);
+            elseLower.setReturnTarget(returnTargetIdx_);
             elseLower.lower(*cs.ifFalse);
             elseAssigns = std::move(elseLower.assignments());
         }
@@ -1179,8 +1275,15 @@ private:
                 }
             }
             if (!falseVal) {
-                auto& sig = mod_.signals[ifA.targetIndex];
-                falseVal = Expr::signalRef(sig.width, sig.index);
+                // When block value tracking, use the pre-branch block value
+                // (so for-loop accumulation with one-armed if works correctly)
+                auto savedBV = savedBlockValues.find(ifA.targetIndex);
+                if (trackBlockValues_ && savedBV != savedBlockValues.end())
+                    falseVal = savedBV->second;
+                else {
+                    auto& sig = mod_.signals[ifA.targetIndex];
+                    falseVal = Expr::signalRef(sig.width, sig.index);
+                }
             }
             auto muxed = Expr::mux(mod_.signals[ifA.targetIndex].width,
                                    cond, ifA.value, falseVal);
@@ -1196,7 +1299,12 @@ private:
             }
             if (!found) {
                 auto& sig = mod_.signals[elseA.targetIndex];
-                auto trueVal = Expr::signalRef(sig.width, sig.index);
+                ExprPtr trueVal;
+                auto savedBV = savedBlockValues.find(elseA.targetIndex);
+                if (trackBlockValues_ && savedBV != savedBlockValues.end())
+                    trueVal = savedBV->second;
+                else
+                    trueVal = Expr::signalRef(sig.width, sig.index);
                 auto muxed = Expr::mux(sig.width, cond, trueVal, elseA.value);
                 assignments_.push_back({elseA.targetIndex, muxed});
                 if (trackBlockValues_)
@@ -1224,8 +1332,10 @@ private:
     }
 
     void lowerList(const slang::ast::StatementList& sl) {
-        for (auto* s : sl.list)
+        for (auto* s : sl.list) {
+            if (breakHit_ || continueHit_) break;
             lower(*s);
+        }
     }
 
     void lowerCase(const slang::ast::CaseStatement& cs) {
@@ -1238,6 +1348,7 @@ private:
         if (cs.defaultCase) {
             el_.restoreBlockValues(savedBlockValues);
             StmtLowering defaultLower(mod_, el_, symbolMap_, trackBlockValues_);
+            defaultLower.setReturnTarget(returnTargetIdx_);
             defaultLower.lower(*cs.defaultCase);
             auto defaultAssigns = std::move(defaultLower.assignments());
             auto defaultArrayStores = extractArrayStores(defaultAssigns);
@@ -1254,6 +1365,7 @@ private:
 
             el_.restoreBlockValues(savedBlockValues);
             StmtLowering itemLower(mod_, el_, symbolMap_, trackBlockValues_);
+            itemLower.setReturnTarget(returnTargetIdx_);
             itemLower.lower(*item.stmt);
             auto itemAssigns = std::move(itemLower.assignments());
             auto itemArrayStores = extractArrayStores(itemAssigns);
@@ -1305,6 +1417,60 @@ private:
             assignments_.push_back(std::move(as));
     }
 };
+
+// Defined after StmtLowering so we can create instances for function body inlining
+ExprPtr ExprLowering::lowerUserFunction(const slang::ast::CallExpression& call) {
+    auto* sub = std::get<const slang::ast::SubroutineSymbol*>(call.subroutine);
+    if (!sub) {
+        std::cerr << "surge: null subroutine in call\n";
+        return Expr::constant(getTypeWidth(*call.type), 0);
+    }
+
+    auto formalArgs = sub->getArguments();
+    auto actualArgs = call.arguments();
+    uint32_t retWidth = getTypeWidth(*call.type);
+
+    // Generate unique prefix for this inlining
+    std::string prefix = "$" + std::string(sub->name) + "$" + std::to_string(inlineCounter_++) + "$";
+
+    // Save block values — function body gets its own scope
+    auto savedBlockValues = saveBlockValues();
+
+    // Map formal arguments to their actual expression values via block values
+    auto& symMap = symbolMapMut();
+    for (size_t i = 0; i < formalArgs.size() && i < actualArgs.size(); i++) {
+        auto& formal = *formalArgs[i];
+        uint32_t argWidth = getTypeWidth(formal.getType());
+        uint32_t argSigIdx = mod_.addSignal(prefix + std::string(formal.name),
+                                            argWidth, SignalKind::Internal);
+        symMap[&formal] = argSigIdx;
+        auto argVal = lower(*actualArgs[i]);
+        setBlockValue(argSigIdx, argVal);
+    }
+
+    // Create return value signal and map it
+    uint32_t retSigIdx = mod_.addSignal(prefix + "ret", retWidth, SignalKind::Internal);
+    if (sub->returnValVar)
+        symMap[sub->returnValVar] = retSigIdx;
+
+    // Lower function body with block value tracking (blocking semantics)
+    StmtLowering bodyLower(mod_, *this, symbolMap_, /*trackBlockValues=*/true);
+    bodyLower.setReturnTarget(retSigIdx);
+    bodyLower.lower(sub->getBody());
+
+    // Get return value from block values (set by assignments in the body)
+    ExprPtr result;
+    auto bvIt = blockValues_.find(retSigIdx);
+    if (bvIt != blockValues_.end())
+        result = bvIt->second;
+    else
+        result = Expr::constant(retWidth, 0);
+
+    // Restore block values to pre-function state
+    restoreBlockValues(savedBlockValues);
+
+    return result;
+}
 
 } // anonymous namespace
 
