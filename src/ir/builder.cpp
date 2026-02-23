@@ -141,6 +141,8 @@ public:
                 return lowerReplication(expr.as<slang::ast::ReplicationExpression>());
             case slang::ast::ExpressionKind::Call:
                 return lowerCall(expr.as<slang::ast::CallExpression>());
+            case slang::ast::ExpressionKind::MemberAccess:
+                return lowerMemberAccess(expr.as<slang::ast::MemberAccessExpression>());
             default:
                 std::cerr << "surge: unsupported expression kind "
                           << static_cast<int>(expr.kind) << "\n";
@@ -423,6 +425,23 @@ private:
         }
         std::cerr << "surge: unsupported call: " << call.getSubroutineName() << "\n";
         return Expr::constant(getTypeWidth(*call.type), 0);
+    }
+
+    ExprPtr lowerMemberAccess(const slang::ast::MemberAccessExpression& ma) {
+        auto src = lower(ma.value());
+        uint32_t fieldWidth = getTypeWidth(*ma.type);
+
+        // For packed structs, field access is a bit slice
+        if (ma.member.kind == slang::ast::SymbolKind::Field) {
+            auto& field = ma.member.as<slang::ast::FieldSymbol>();
+            uint32_t lo = static_cast<uint32_t>(field.bitOffset);
+            uint32_t hi = lo + fieldWidth - 1;
+            return Expr::slice(fieldWidth, src, hi, lo);
+        }
+
+        std::cerr << "surge: unsupported member access on '"
+                  << ma.member.name << "'\n";
+        return Expr::constant(fieldWidth, 0);
     }
 
     ExprPtr lowerElementSelect(const slang::ast::ElementSelectExpression& es) {
@@ -758,6 +777,8 @@ private:
             lowerRangeAssignment(lhs.as<slang::ast::RangeSelectExpression>(), rhs);
         } else if (lhs.kind == slang::ast::ExpressionKind::Concatenation) {
             lowerConcatAssignment(lhs.as<slang::ast::ConcatenationExpression>(), rhs);
+        } else if (lhs.kind == slang::ast::ExpressionKind::MemberAccess) {
+            lowerMemberAssignment(lhs.as<slang::ast::MemberAccessExpression>(), rhs);
         } else {
             std::cerr << "surge: unsupported LHS kind "
                       << static_cast<int>(lhs.kind) << " in assignment\n";
@@ -914,6 +935,65 @@ private:
         auto shiftedRhs = Expr::binary(BinaryOp::Shl, sig.width, maskedRhs, loExpr);
         auto result = Expr::binary(BinaryOp::Or, sig.width, cleared, shiftedRhs);
         assignments_.push_back({sigIdx, result});
+    }
+
+    void lowerMemberAssignment(const slang::ast::MemberAccessExpression& ma, ExprPtr rhs) {
+        // Packed struct field assignment: pt.x <= val
+        // Becomes: pt <= (pt & ~(mask << offset)) | ((val & mask) << offset)
+        if (ma.member.kind != slang::ast::SymbolKind::Field) {
+            std::cerr << "surge: unsupported member assignment\n";
+            return;
+        }
+        auto& field = ma.member.as<slang::ast::FieldSymbol>();
+        uint32_t fieldWidth = getTypeWidth(*ma.type);
+        uint32_t lo = static_cast<uint32_t>(field.bitOffset);
+
+        // Resolve the base signal
+        const slang::ast::Symbol* baseSym = nullptr;
+        if (ma.value().kind == slang::ast::ExpressionKind::NamedValue)
+            baseSym = &ma.value().as<slang::ast::NamedValueExpression>().symbol;
+        if (!baseSym) {
+            std::cerr << "surge: unsupported member assign base\n";
+            return;
+        }
+        uint32_t sigIdx = resolveSignalIndex(*baseSym);
+        if (sigIdx == UINT32_MAX) {
+            std::cerr << "surge: unknown signal for member assign\n";
+            return;
+        }
+        auto& sig = mod_.signals[sigIdx];
+
+        // Chain RMW: if there's already a pending assignment to this signal,
+        // use its RHS as the base (so pt.x then pt.y both update correctly).
+        ExprPtr current;
+        int existingIdx = -1;
+        for (int j = static_cast<int>(assignments_.size()) - 1; j >= 0; j--) {
+            if (assignments_[j].targetIndex == sigIdx && !assignments_[j].indexExpr) {
+                current = assignments_[j].value;
+                existingIdx = j;
+                break;
+            }
+        }
+        if (!current)
+            current = el_.lower(ma.value());
+
+        // Read-modify-write
+        uint64_t fieldMask = (fieldWidth >= 64) ? ~0ULL : ((1ULL << fieldWidth) - 1);
+        auto mask = Expr::constant(sig.width, fieldMask);
+        auto loConst = Expr::constant(sig.width, lo);
+        auto shiftedMask = Expr::binary(BinaryOp::Shl, sig.width, mask, loConst);
+        auto invMask = Expr::unary(UnaryOp::Not, sig.width, shiftedMask);
+        auto cleared = Expr::binary(BinaryOp::And, sig.width, current, invMask);
+        auto maskedRhs = Expr::binary(BinaryOp::And, sig.width, rhs, mask);
+        auto shiftedRhs = Expr::binary(BinaryOp::Shl, sig.width, maskedRhs, loConst);
+        auto result = Expr::binary(BinaryOp::Or, sig.width, cleared, shiftedRhs);
+        if (existingIdx >= 0) {
+            assignments_[existingIdx].value = result;  // replace in-place
+        } else {
+            assignments_.push_back({sigIdx, result});
+        }
+        if (trackBlockValues_)
+            el_.setBlockValue(sigIdx, result);
     }
 
     void lowerConcatAssignment(const slang::ast::ConcatenationExpression& cc, ExprPtr rhs) {

@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 14 complete.** Redundant assignment deduplication recovers CRC-32 performance (46→59 MHz).
+**Sprint 15 complete.** Packed struct support with field read (bit slice) and write (chained read-modify-write).
 
 Next priorities:
-1. **Struct types**: Packed structs with field access.
-2. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-4. **Wider test coverage**: More complex SV patterns, larger benchmarks.
+1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+3. **Wider test coverage**: More complex SV patterns, larger benchmarks.
+4. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
 
 ### Project Structure
 ```
@@ -44,6 +44,7 @@ surge/
     fifo.sv
     crc32.sv
     spi_master.sv
+    struct_test.sv
     param_adder.sv
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
@@ -309,6 +310,11 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
 | CRC-32 | **59 MHz** | — | — | PASS |
 | SPI Master | **133 MHz** | — | — | PASS |
+
+### Sprint 15: Packed Struct Support (complete)
+- **Packed struct field read (RHS)**: `MemberAccessExpression` on packed structs lowered as bit slice using `FieldSymbol.bitOffset`. `pt.x` → `Expr::slice(fieldWidth, src, hi, lo)`.
+- **Packed struct field write (LHS)**: Read-modify-write pattern: `sig = (sig & ~(mask << offset)) | ((val & mask) << offset)`. Multiple field writes to the same struct signal are **chained** — the second RMW uses the first RMW's result as the base, not the original signal. Produces a single merged assignment instead of conflicting overwrites.
+- New test: `struct_test.sv` — packed struct with two 16-bit fields, field read/write in always_ff. Verified cycle-accurate against Verilator.
 
 ## Research
 
