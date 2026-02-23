@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 13 complete.** Multi-file, while/repeat loops, local variables, case/wildcard equality, SPI benchmark.
+**Sprint 14 complete.** Redundant assignment deduplication recovers CRC-32 performance (46→59 MHz).
 
 Next priorities:
 1. **Struct types**: Packed structs with field access.
-2. **Performance: reduce redundant assignments from block value tracking**.
-3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-4. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+2. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+4. **Wider test coverage**: More complex SV patterns, larger benchmarks.
 
 ### Project Structure
 ```
@@ -296,6 +296,19 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | FIFO (8x32) | **82 MHz** | — | — | PASS |
 | CRC-32 | **46 MHz** | — | — | PASS |
 | SPI Master | **129 MHz** | — | — | PASS |
+
+### Sprint 14: Assignment Deduplication (complete)
+- **Redundant assignment elimination**: In combinational processes with blocking semantics (always_comb), deduplicate assignments to the same target signal — keep only the last write. Eliminates redundant intermediate stores from for-loop accumulation patterns.
+- CRC-32 performance recovered from 46→59 MHz (+28%), matching pre-block-value-tracking levels.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **260 MHz** | 23 MHz | **11.3x** | PASS |
+| ALU+Regfile | **126 MHz** | 33 MHz | **3.8x** | PASS |
+| RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
+| CRC-32 | **59 MHz** | — | — | PASS |
+| SPI Master | **133 MHz** | — | — | PASS |
 
 ## Research
 
