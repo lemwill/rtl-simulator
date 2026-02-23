@@ -62,6 +62,8 @@ SimResult Runtime::run() {
             writeSignal(clkSig->index, 1);
             evalFn_(state_.data(), nextState_.data());
             commitFFs();
+            // Re-settle combinational outputs after FF update
+            evalFn_(state_.data(), nextState_.data());
             traceAll();
             time_ += 5;
 
@@ -70,6 +72,10 @@ SimResult Runtime::run() {
             time_ += 5;
         }
     }
+
+    // Final combinational settle: re-evaluate to update comb outputs
+    // after the last commitFFs. Sequential writes to nextState are discarded.
+    evalFn_(state_.data(), nextState_.data());
 
     auto endTime = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = endTime - startTime;
