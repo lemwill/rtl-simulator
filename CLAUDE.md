@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 3 complete.** Unpacked arrays, for loops, 32-bit ALU+regfile benchmark.
+**Sprint 4 complete.** Computed store optimization — ALU now 2.6x faster than Verilator.
 
 Next priorities:
-1. **Performance**: ALU+regfile is slower than Verilator (18.7 vs 33 MHz). Key bottleneck: mux-guarded dynamic writes generate 8 selects per register write. Need computed store optimization or LLVM-level array lowering.
-2. **Testbench input driving**: Currently only clock/reset driven. Need stimulus mechanism to exercise ALU operations.
-3. **Multi-module hierarchy**: Module instantiation and port binding.
-4. **Generate blocks**: Parameterized module generation.
+1. **Testbench input driving**: Currently only clock/reset driven. Need stimulus mechanism to exercise ALU operations and produce non-trivial outputs.
+2. **Multi-module hierarchy**: Module instantiation and port binding.
+3. **Generate blocks**: Parameterized module generation.
+4. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
 
 ### Project Structure
 ```
@@ -129,6 +129,21 @@ Once the full pipeline is working, include performance metrics vs verilator.
 | ALU+8x32 Regfile | 18.7 MHz | **33 MHz** | 0.58x | PASS |
 
 ALU regression: mux-guarded dynamic writes are 8x per register write. Needs computed store optimization.
+
+### Sprint 4: Computed Store Optimization (complete)
+- Replaced mux-guarded dynamic array writes (N assignments) with single computed GEP store
+- Extended `Assignment` struct with optional `indexExpr`, `arraySize`, `elementWidth` for array stores
+- Added `emitArrayStore()` codegen method mirroring `ArrayElement` load pattern
+- Fixed `lowerConditional()` and `lowerCase()` to partition array-store assignments from scalar merge logic
+- Optimized `commitFFs()`: precomputed contiguous FF regions for bulk memcpy (eliminates per-signal branching)
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge Sprint 3 | Surge Sprint 4 | Verilator 5.045 | Speedup |
+|--------|---------------|----------------|-----------------|---------|
+| LFSR 8-bit | 100 MHz | **133 MHz** | 30 MHz | **4.4x** |
+| ALU+8x32 Regfile | 18.7 MHz | **75 MHz** | 29 MHz | **2.6x** |
+
+ALU: 4x speedup from computed store. Both designs now faster than Verilator.
 
 ## Research
 

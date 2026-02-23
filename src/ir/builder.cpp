@@ -587,16 +587,14 @@ private:
             return;
         }
 
-        // Dynamic index: assign to ALL elements, each guarded by a mux
-        // regfile[sel] = rhs  -->  for each i: regfile[i] = (sel == i) ? rhs : regfile[i]
-        for (uint32_t i = 0; i < info.size; i++) {
-            uint32_t sigIdx = info.baseSignalIndex + i;
-            auto cond = Expr::binary(BinaryOp::Eq, 1, selExpr,
-                                     Expr::constant(selExpr->width, i));
-            auto currentVal = Expr::signalRef(info.elementWidth, sigIdx);
-            auto muxed = Expr::mux(info.elementWidth, cond, rhs, currentVal);
-            assignments_.push_back({sigIdx, muxed});
-        }
+        // Dynamic index: emit a single computed array store
+        Assignment a;
+        a.targetIndex  = info.baseSignalIndex;
+        a.value        = rhs;
+        a.indexExpr    = selExpr;
+        a.arraySize    = info.size;
+        a.elementWidth = info.elementWidth;
+        assignments_.push_back(std::move(a));
     }
 
     void lowerForLoop(const slang::ast::ForLoopStatement& fl) {
@@ -659,6 +657,20 @@ private:
             std::cerr << "surge: for loop unroll limit reached (" << MAX_UNROLL << ")\n";
     }
 
+    // Partition array-store assignments from scalar assignments
+    static std::vector<Assignment> extractArrayStores(std::vector<Assignment>& assigns) {
+        std::vector<Assignment> arrayStores;
+        std::vector<Assignment> scalar;
+        for (auto& a : assigns) {
+            if (a.indexExpr)
+                arrayStores.push_back(std::move(a));
+            else
+                scalar.push_back(std::move(a));
+        }
+        assigns = std::move(scalar);
+        return arrayStores;
+    }
+
     void lowerConditional(const slang::ast::ConditionalStatement& cs) {
         auto& conditions = cs.conditions;
         ExprPtr cond;
@@ -678,6 +690,11 @@ private:
             elseAssigns = std::move(elseLower.assignments());
         }
 
+        // Separate array stores from scalar assignments before merging
+        auto ifArrayStores = extractArrayStores(ifAssigns);
+        auto elseArrayStores = extractArrayStores(elseAssigns);
+
+        // Merge scalar assignments with mux (existing logic)
         for (auto& ifA : ifAssigns) {
             ExprPtr falseVal;
             for (auto& elseA : elseAssigns) {
@@ -707,6 +724,20 @@ private:
                 assignments_.push_back({elseA.targetIndex, muxed});
             }
         }
+
+        // Handle array stores: wrap value in condition mux, preserve array metadata
+        for (auto& as : ifArrayStores) {
+            auto currentElem = Expr::arrayElement(as.elementWidth, as.targetIndex,
+                                                   as.arraySize, as.indexExpr);
+            as.value = Expr::mux(as.elementWidth, cond, as.value, currentElem);
+            assignments_.push_back(std::move(as));
+        }
+        for (auto& as : elseArrayStores) {
+            auto currentElem = Expr::arrayElement(as.elementWidth, as.targetIndex,
+                                                   as.arraySize, as.indexExpr);
+            as.value = Expr::mux(as.elementWidth, cond, currentElem, as.value);
+            assignments_.push_back(std::move(as));
+        }
     }
 
     void lowerBlock(const slang::ast::BlockStatement& bs) {
@@ -721,13 +752,19 @@ private:
     void lowerCase(const slang::ast::CaseStatement& cs) {
         auto selectorExpr = el_.lower(cs.expr);
 
-        // Collect default assignments
+        // Collect default assignments (scalar only; array stores handled separately)
         std::unordered_map<uint32_t, ExprPtr> currentValues;
+        std::vector<Assignment> arrayStoreAccum; // accumulated array stores with conditions
         if (cs.defaultCase) {
             StmtLowering defaultLower(mod_, el_);
             defaultLower.lower(*cs.defaultCase);
-            for (auto& a : defaultLower.assignments())
+            auto defaultAssigns = std::move(defaultLower.assignments());
+            auto defaultArrayStores = extractArrayStores(defaultAssigns);
+            for (auto& a : defaultAssigns)
                 currentValues[a.targetIndex] = a.value;
+            // Default array stores get no condition wrapping — they are the fallback
+            for (auto& as : defaultArrayStores)
+                arrayStoreAccum.push_back(std::move(as));
         }
 
         // Process items in reverse for correct priority (first match wins)
@@ -737,6 +774,7 @@ private:
             StmtLowering itemLower(mod_, el_);
             itemLower.lower(*item.stmt);
             auto itemAssigns = std::move(itemLower.assignments());
+            auto itemArrayStores = extractArrayStores(itemAssigns);
 
             // Build condition: selector == expr1 || selector == expr2 || ...
             ExprPtr cond;
@@ -751,7 +789,7 @@ private:
             if (!cond)
                 cond = Expr::constant(1, 0);
 
-            // Wrap each assignment in a mux
+            // Wrap scalar assignments in a mux
             for (auto& ia : itemAssigns) {
                 ExprPtr falseVal;
                 auto it = currentValues.find(ia.targetIndex);
@@ -765,10 +803,20 @@ private:
                                        cond, ia.value, falseVal);
                 currentValues[ia.targetIndex] = muxed;
             }
+
+            // Wrap array stores in a condition mux
+            for (auto& as : itemArrayStores) {
+                auto currentElem = Expr::arrayElement(as.elementWidth, as.targetIndex,
+                                                       as.arraySize, as.indexExpr);
+                as.value = Expr::mux(as.elementWidth, cond, as.value, currentElem);
+                arrayStoreAccum.push_back(std::move(as));
+            }
         }
 
         for (auto& [targetIdx, val] : currentValues)
             assignments_.push_back({targetIdx, val});
+        for (auto& as : arrayStoreAccum)
+            assignments_.push_back(std::move(as));
     }
 };
 
@@ -901,8 +949,15 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
             proc.assignments = std::move(stmtLower.assignments());
 
             if (proc.kind == Process::Sequential) {
-                for (auto& a : proc.assignments)
-                    mod->signals[a.targetIndex].isFF = true;
+                for (auto& a : proc.assignments) {
+                    if (a.indexExpr) {
+                        // Array store: mark all elements as FFs
+                        for (uint32_t i = 0; i < a.arraySize; i++)
+                            mod->signals[a.targetIndex + i].isFF = true;
+                    } else {
+                        mod->signals[a.targetIndex].isFF = true;
+                    }
+                }
             }
 
             mod->processes.push_back(std::move(proc));

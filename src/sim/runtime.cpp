@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -10,6 +11,7 @@ Runtime::Runtime(const ir::Module& mod, codegen::EvalFn evalFn, const SimConfig&
 {
     state_.resize(mod.stateSize, 0);
     nextState_.resize(mod.stateSize, 0);
+    buildFFRegions();
 
     if (!cfg_.vcdPath.empty()) {
         vcd_ = std::make_unique<trace::VCDWriter>(cfg_.vcdPath);
@@ -108,12 +110,29 @@ void Runtime::writeSignal(uint32_t index, uint64_t val) {
     std::memcpy(state_.data() + sig.stateOffset, &val, bytes);
 }
 
-void Runtime::commitFFs() {
+void Runtime::buildFFRegions() {
+    // Collect (offset, bytes) for each FF signal
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
     for (auto& sig : mod_.signals) {
         if (!sig.isFF) continue;
-        uint32_t bytes = ir::bytesForWidth(sig.width);
-        std::memcpy(state_.data() + sig.stateOffset,
-                    nextState_.data() + sig.stateOffset, bytes);
+        ranges.push_back({sig.stateOffset, ir::bytesForWidth(sig.width)});
+    }
+    // Sort by offset
+    std::sort(ranges.begin(), ranges.end());
+    // Merge contiguous ranges into bulk regions
+    for (auto& [off, len] : ranges) {
+        if (!ffRegions_.empty() && ffRegions_.back().offset + ffRegions_.back().bytes == off) {
+            ffRegions_.back().bytes += len;
+        } else {
+            ffRegions_.push_back({off, len});
+        }
+    }
+}
+
+void Runtime::commitFFs() {
+    for (auto& r : ffRegions_) {
+        std::memcpy(state_.data() + r.offset,
+                    nextState_.data() + r.offset, r.bytes);
     }
 }
 

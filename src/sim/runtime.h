@@ -47,6 +47,14 @@ private:
     std::unique_ptr<trace::VCDWriter> vcd_;
     uint64_t time_ = 0;
 
+    // Precomputed contiguous FF regions for bulk memcpy
+    struct FFRegion {
+        uint32_t offset;
+        uint32_t bytes;
+    };
+    std::vector<FFRegion> ffRegions_;
+
+    void buildFFRegions();
     void commitFFs();
     void traceAll();
 };

@@ -73,8 +73,13 @@ struct Expr {
 // ── Processes ───────────────────────────────────────────────────────────────
 
 struct Assignment {
-    uint32_t targetIndex; // signal index
+    uint32_t targetIndex; // signal index (scalar) or base signal index (array store)
     ExprPtr  value;
+
+    // Optional: computed array store (non-null indexExpr => array store)
+    ExprPtr  indexExpr;        // runtime index expression
+    uint32_t arraySize     = 0; // element count for bounds clamping
+    uint32_t elementWidth  = 0; // bit width per element
 };
 
 enum class EdgeKind { Posedge, Negedge };

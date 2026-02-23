@@ -68,11 +68,18 @@ public:
         for (auto& proc : mod_.processes) {
             for (auto& assign : proc.assignments) {
                 auto* val = emitExpr(assign.value, state);
-                auto& sig = mod_.signals[assign.targetIndex];
 
                 // Sequential assigns write to next_state, combinational to state
-                auto* basePtr = (proc.kind == ir::Process::Sequential) ? nextState : state;
-                storeSignal(basePtr, sig, val);
+                auto* storeBase = (proc.kind == ir::Process::Sequential) ? nextState : state;
+
+                if (assign.indexExpr) {
+                    // Computed array store
+                    emitArrayStore(storeBase, state, assign, val);
+                } else {
+                    // Scalar store
+                    auto& sig = mod_.signals[assign.targetIndex];
+                    storeSignal(storeBase, sig, val);
+                }
             }
         }
 
@@ -103,6 +110,42 @@ private:
         if (bytes * 8 > sig.width)
             val = builder_.CreateTrunc(val, intTy(sig.width));
         return val;
+    }
+
+    /// Computed array store: GEP with runtime index
+    void emitArrayStore(llvm::Value* storeBase, llvm::Value* readBase,
+                        const ir::Assignment& assign, llvm::Value* val) {
+        auto* indexVal = emitExpr(assign.indexExpr, readBase);
+        uint32_t baseIdx    = assign.targetIndex;
+        uint32_t arrSize    = assign.arraySize;
+        uint32_t elemWidth  = assign.elementWidth;
+        uint32_t elemBytes  = ir::bytesForWidth(elemWidth);
+
+        // Clamp index to [0, arrSize-1]
+        auto* i32Ty = llvm::Type::getInt32Ty(ctx_);
+        auto* idx32 = builder_.CreateZExtOrTrunc(indexVal, i32Ty);
+        auto* maxIdx = llvm::ConstantInt::get(i32Ty, arrSize - 1);
+        auto* oob = builder_.CreateICmpUGT(idx32, maxIdx);
+        auto* clampedIdx = builder_.CreateSelect(oob, maxIdx, idx32);
+
+        // Compute byte offset: baseOffset + clampedIdx * elemBytes
+        uint32_t baseOffset = mod_.signals[baseIdx].stateOffset;
+        auto* baseConst = llvm::ConstantInt::get(i32Ty, baseOffset);
+        auto* elemBytesConst = llvm::ConstantInt::get(i32Ty, elemBytes);
+        auto* offsetFromBase = builder_.CreateMul(clampedIdx, elemBytesConst);
+        auto* totalOffset = builder_.CreateAdd(baseConst, offsetFromBase);
+
+        // GEP into store base with computed offset
+        auto* ptr = builder_.CreateGEP(
+            llvm::Type::getInt8Ty(ctx_), storeBase, totalOffset);
+
+        // Extend/truncate value to storage width and store
+        auto* storeTy = intTy(elemBytes * 8);
+        if (val->getType()->getIntegerBitWidth() < elemBytes * 8)
+            val = builder_.CreateZExt(val, storeTy);
+        else if (val->getType()->getIntegerBitWidth() > elemBytes * 8)
+            val = builder_.CreateTrunc(val, storeTy);
+        builder_.CreateStore(val, ptr);
     }
 
     /// Store a value to a signal in state
