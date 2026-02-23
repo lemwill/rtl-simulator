@@ -250,7 +250,9 @@ private:
             case slang::ast::BinaryOperator::LogicalShiftLeft:  op = BinaryOp::Shl; break;
             case slang::ast::BinaryOperator::LogicalShiftRight: op = BinaryOp::Shr; break;
             case slang::ast::BinaryOperator::ArithmeticShiftLeft:  op = BinaryOp::Shl; break;
-            case slang::ast::BinaryOperator::ArithmeticShiftRight: op = BinaryOp::AShr; break;
+            case slang::ast::BinaryOperator::ArithmeticShiftRight:
+                op = be.left().type->isSigned() ? BinaryOp::AShr : BinaryOp::Shr;
+                break;
             case slang::ast::BinaryOperator::Divide:       op = BinaryOp::Div; break;
             case slang::ast::BinaryOperator::Mod:          op = BinaryOp::Mod; break;
             case slang::ast::BinaryOperator::BinaryXnor:
@@ -408,6 +410,7 @@ private:
     ExprPtr lowerRangeSelect(const slang::ast::RangeSelectExpression& rs) {
         auto src = lower(rs.value());
         uint32_t resultWidth = getTypeWidth(*rs.type);
+        uint32_t srcWidth = getTypeWidth(*rs.value().type);
         auto selKind = rs.getSelectionKind();
 
         auto leftVal = extractConstantInt(rs.left());
@@ -429,6 +432,26 @@ private:
                 return Expr::constant(resultWidth, 0);
             }
             return Expr::slice(resultWidth, src, base, base - resultWidth + 1);
+        }
+
+        // Dynamic range select: start is a runtime expression, width is constant
+        if (selKind == slang::ast::RangeSelectionKind::IndexedUp) {
+            // sig[start+:WIDTH] → (src >> start) truncated to WIDTH bits
+            auto startExpr = lower(rs.left());
+            auto shifted = Expr::binary(BinaryOp::Shr, srcWidth, src, startExpr);
+            uint64_t mask = (resultWidth >= 64) ? ~0ULL : ((1ULL << resultWidth) - 1);
+            return Expr::binary(BinaryOp::And, resultWidth, shifted,
+                Expr::constant(srcWidth, mask));
+        }
+        if (selKind == slang::ast::RangeSelectionKind::IndexedDown) {
+            // sig[start-:WIDTH] → (src >> (start - WIDTH + 1)) truncated to WIDTH bits
+            auto startExpr = lower(rs.left());
+            auto base = Expr::binary(BinaryOp::Sub, startExpr->width, startExpr,
+                Expr::constant(startExpr->width, resultWidth - 1));
+            auto shifted = Expr::binary(BinaryOp::Shr, srcWidth, src, base);
+            uint64_t mask = (resultWidth >= 64) ? ~0ULL : ((1ULL << resultWidth) - 1);
+            return Expr::binary(BinaryOp::And, resultWidth, shifted,
+                Expr::constant(srcWidth, mask));
         }
 
         std::cerr << "surge: unsupported range select (dynamic bounds)\n";
@@ -611,6 +634,8 @@ private:
             assignments_.push_back({sigIdx, rhs});
         } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
             lowerIndexedAssignment(lhs.as<slang::ast::ElementSelectExpression>(), rhs);
+        } else if (lhs.kind == slang::ast::ExpressionKind::RangeSelect) {
+            lowerRangeAssignment(lhs.as<slang::ast::RangeSelectExpression>(), rhs);
         } else {
             std::cerr << "surge: unsupported LHS kind "
                       << static_cast<int>(lhs.kind) << " in assignment\n";
@@ -632,7 +657,37 @@ private:
         auto& arrayMap = el_.arrayMap();
         auto arrIt = arrayMap.find(baseSym);
         if (arrIt == arrayMap.end()) {
-            std::cerr << "surge: packed bit assignment not yet supported\n";
+            // Packed bit assignment: sig[idx] <= rhs
+            // Becomes: sig <= (sig & ~(1 << idx)) | ((rhs & 1) << idx)
+            uint32_t sigIdx = resolveSignalIndex(*baseSym);
+            if (sigIdx == UINT32_MAX) {
+                std::cerr << "surge: unknown signal for packed bit assign '"
+                          << baseSym->name << "'\n";
+                return;
+            }
+            auto& sig = mod_.signals[sigIdx];
+            auto current = el_.lower(es.value()); // current signal value
+            auto one = Expr::constant(sig.width, 1);
+
+            auto constIdx = extractConstantInt(es.selector());
+            if (constIdx) {
+                uint32_t bit = static_cast<uint32_t>(*constIdx);
+                uint64_t mask = ~(uint64_t(1) << bit);
+                auto cleared = Expr::binary(BinaryOp::And, sig.width, current,
+                    Expr::constant(sig.width, mask));
+                auto rhsBit = Expr::binary(BinaryOp::And, sig.width, rhs, one);
+                auto shifted = Expr::binary(BinaryOp::Shl, sig.width, rhsBit,
+                    Expr::constant(sig.width, bit));
+                assignments_.push_back({sigIdx, Expr::binary(BinaryOp::Or, sig.width, cleared, shifted)});
+            } else {
+                auto selExpr = el_.lower(es.selector());
+                auto mask = Expr::unary(UnaryOp::Not, sig.width,
+                    Expr::binary(BinaryOp::Shl, sig.width, one, selExpr));
+                auto cleared = Expr::binary(BinaryOp::And, sig.width, current, mask);
+                auto rhsBit = Expr::binary(BinaryOp::And, sig.width, rhs, one);
+                auto shifted = Expr::binary(BinaryOp::Shl, sig.width, rhsBit, selExpr);
+                assignments_.push_back({sigIdx, Expr::binary(BinaryOp::Or, sig.width, cleared, shifted)});
+            }
             return;
         }
 
@@ -679,6 +734,64 @@ private:
         a.arraySize    = info.size;
         a.elementWidth = info.elementWidth;
         assignments_.push_back(std::move(a));
+    }
+
+    void lowerRangeAssignment(const slang::ast::RangeSelectExpression& rs, ExprPtr rhs) {
+        // Packed range assignment: sig[hi:lo] <= rhs or sig[start+:W] <= rhs
+        // Becomes: sig <= (sig & ~(mask << lo)) | ((rhs & mask) << lo)
+        const slang::ast::Symbol* baseSym = nullptr;
+        if (rs.value().kind == slang::ast::ExpressionKind::NamedValue) {
+            baseSym = &rs.value().as<slang::ast::NamedValueExpression>().symbol;
+        }
+        if (!baseSym) {
+            std::cerr << "surge: unsupported range assignment base\n";
+            return;
+        }
+        uint32_t sigIdx = resolveSignalIndex(*baseSym);
+        if (sigIdx == UINT32_MAX) {
+            std::cerr << "surge: unknown signal for range assign '" << baseSym->name << "'\n";
+            return;
+        }
+        auto& sig = mod_.signals[sigIdx];
+        auto current = el_.lower(rs.value()); // current signal value
+        uint32_t rangeWidth = getTypeWidth(*rs.type);
+        uint64_t rangeMask = (rangeWidth >= 64) ? ~0ULL : ((1ULL << rangeWidth) - 1);
+
+        auto selKind = rs.getSelectionKind();
+        auto leftVal = extractConstantInt(rs.left());
+        auto rightVal = extractConstantInt(rs.right());
+
+        ExprPtr loExpr;
+        if (selKind == slang::ast::RangeSelectionKind::Simple && leftVal && rightVal) {
+            loExpr = Expr::constant(sig.width, *rightVal);
+        } else if (selKind == slang::ast::RangeSelectionKind::IndexedUp) {
+            // sig[start+:W]: lo = start
+            if (leftVal)
+                loExpr = Expr::constant(sig.width, *leftVal);
+            else
+                loExpr = el_.lower(rs.left());
+        } else if (selKind == slang::ast::RangeSelectionKind::IndexedDown) {
+            // sig[start-:W]: lo = start - W + 1
+            if (leftVal)
+                loExpr = Expr::constant(sig.width, *leftVal - rangeWidth + 1);
+            else
+                loExpr = Expr::binary(BinaryOp::Sub, sig.width,
+                    el_.lower(rs.left()),
+                    Expr::constant(sig.width, rangeWidth - 1));
+        } else {
+            std::cerr << "surge: unsupported range assignment kind\n";
+            return;
+        }
+
+        // Build: sig = (sig & ~(mask << lo)) | ((rhs & mask) << lo)
+        auto mask = Expr::constant(sig.width, rangeMask);
+        auto shiftedMask = Expr::binary(BinaryOp::Shl, sig.width, mask, loExpr);
+        auto invMask = Expr::unary(UnaryOp::Not, sig.width, shiftedMask);
+        auto cleared = Expr::binary(BinaryOp::And, sig.width, current, invMask);
+        auto maskedRhs = Expr::binary(BinaryOp::And, sig.width, rhs, mask);
+        auto shiftedRhs = Expr::binary(BinaryOp::Shl, sig.width, maskedRhs, loExpr);
+        auto result = Expr::binary(BinaryOp::Or, sig.width, cleared, shiftedRhs);
+        assignments_.push_back({sigIdx, result});
     }
 
     void lowerForLoop(const slang::ast::ForLoopStatement& fl) {

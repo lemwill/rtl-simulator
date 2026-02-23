@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 9 complete.** SV feature coverage: generate blocks, parameter overrides, enum types.
+**Sprint 10 complete.** Packed bit assignment, dynamic range select/assign, comb settle bugfix, unsigned `>>>` fix.
 
 Next priorities:
 1. **Dead signal elimination**: Remove signals not read by any process or output.
 2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
 3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-4. **Ternary operator in continuous assigns**: `assign x = cond ? a : b;`
+4. **Wider test coverage**: More complex SV patterns (always_latch, tri-state, etc.)
 
 ### Project Structure
 ```
@@ -40,6 +40,7 @@ surge/
     pipeline_datapath.sv
     counter_hier.sv
     riscv_pipeline.sv
+    barrel_shifter.sv
     param_adder.sv
     generate_chain.sv
     enum_fsm.sv
@@ -224,6 +225,22 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 - **Enum types**: `EnumValueSymbol` handling in `lowerNamedValue()` — extracts integer value via `getValue()`.
 - **Parameter overrides**: Already work via slang elaboration (no Surge changes needed).
 - New tests: `param_adder.sv` (parameterized adder with `#(.WIDTH(16))`), `generate_chain.sv` (generate-for chain of 4 adders), `enum_fsm.sv` (FSM with typedef enum). All verified cycle-accurate against Verilator.
+
+### Sprint 10: Packed Bit/Range Operations + Bugfixes (complete)
+- **Packed bit assignment**: `sig[idx] <= val` on packed types. Read-modify-write pattern: `sig = (sig & ~(1<<idx)) | ((val&1)<<idx)`. Supports both constant and dynamic indices.
+- **Dynamic range select**: `sig[start+:W]` and `sig[start-:W]` with runtime start. Lowered as `(src >> start) & mask`.
+- **Packed range assignment**: `sig[start+:W] <= val` on LHS. Read-modify-write: `sig = (sig & ~(mask<<lo)) | ((val&mask)<<lo)`. Supports Simple, IndexedUp, IndexedDown with constant or dynamic bounds.
+- **Bugfix: combinational settle after FF update**: Added final `evalFn_` call after simulation loop, and re-eval in VCD path after commitFFs. Previously, combinational outputs driven from FFs were one cycle stale.
+- **Bugfix: unsigned `>>>`**: `ArithmeticShiftRight` on unsigned operands now maps to logical shift right (same as `>>`). Previously emitted `CreateAShr` unconditionally, incorrectly sign-extending unsigned values.
+- New test: `barrel_shifter.sv` — 32-bit barrel shifter with SHL/SHR/SRA/rotate, dynamic byte extraction, packed bit/range writes, checksum accumulator. Verified cycle-accurate against Verilator.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **268 MHz** | 23 MHz | **11.6x** | PASS |
+| ALU+Regfile | **128 MHz** | 33 MHz | **3.9x** | PASS |
+| RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
+| Barrel Shifter | **138 MHz** | — | — | PASS |
 
 ## Research
 
