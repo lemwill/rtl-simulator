@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 8 complete.** Identity-mux elimination with pre-copy. RISC-V pipeline 51→68 MHz (+33%).
+**Sprint 9 complete.** SV feature coverage: generate blocks, parameter overrides, enum types.
 
 Next priorities:
 1. **Dead signal elimination**: Remove signals not read by any process or output.
-2. **Generate blocks**: Parameterized module generation.
-3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-4. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
+3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+4. **Ternary operator in continuous assigns**: `assign x = cond ? a : b;`
 
 ### Project Structure
 ```
@@ -40,6 +40,9 @@ surge/
     pipeline_datapath.sv
     counter_hier.sv
     riscv_pipeline.sv
+    param_adder.sv
+    generate_chain.sv
+    enum_fsm.sv
   bench/
     run_bench.sh            # Surge vs Verilator benchmark
 ```
@@ -214,6 +217,13 @@ RISC-V pipeline is the most complex design yet — 70 signals including a 32-ent
 | RISC-V 5-Stage Pipeline | 51 MHz | **68 MHz** | 22 MHz | **3.1x** | PASS |
 
 RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
+
+### Sprint 9: SV Feature Coverage (complete)
+- **Generate blocks**: Recursive `collectMembers` helper flattens `GenerateBlockSymbol`/`GenerateBlockArraySymbol` scopes. All member iteration (variables, nets, instances, processes) uses flattened list. Port iteration still uses `body.members()` directly (ports aren't inside generate blocks).
+- **Constant expression evaluation**: `extractConstantInt()` enhanced with `expr.getConstant()` fallback for slang pre-computed values (genvar arithmetic like `i+1`).
+- **Enum types**: `EnumValueSymbol` handling in `lowerNamedValue()` — extracts integer value via `getValue()`.
+- **Parameter overrides**: Already work via slang elaboration (no Surge changes needed).
+- New tests: `param_adder.sv` (parameterized adder with `#(.WIDTH(16))`), `generate_chain.sv` (generate-for chain of 4 adders), `enum_fsm.sv` (FSM with typedef enum). All verified cycle-accurate against Verilator.
 
 ## Research
 

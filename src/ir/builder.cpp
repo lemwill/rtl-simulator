@@ -50,6 +50,10 @@ std::optional<uint64_t> extractConstantInt(const slang::ast::Expression& expr) {
     if (expr.kind == slang::ast::ExpressionKind::Conversion) {
         return extractConstantInt(expr.as<slang::ast::ConversionExpression>().operand());
     }
+    // Try slang's pre-computed constant value (handles genvar expressions, param arithmetic)
+    auto* cv = expr.getConstant();
+    if (cv && cv->isInteger())
+        return cv->integer().as<uint64_t>();
     return std::nullopt;
 }
 
@@ -147,6 +151,18 @@ private:
         auto lvIt = loopVarValues_.find(&sym);
         if (lvIt != loopVarValues_.end()) {
             return Expr::constant(getTypeWidth(*nv.type), lvIt->second);
+        }
+
+        // Handle enum values as constants
+        if (sym.kind == slang::ast::SymbolKind::EnumValue) {
+            auto& ev = sym.as<slang::ast::EnumValueSymbol>();
+            auto& cv = ev.getValue();
+            uint64_t v = 0;
+            if (cv.isInteger()) {
+                if (auto opt = cv.integer().as<uint64_t>())
+                    v = *opt;
+            }
+            return Expr::constant(getTypeWidth(*nv.type), v);
         }
 
         // Handle parameters/localparams as constants
@@ -937,13 +953,37 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
     SymbolMap symbolMap;
 
     // Forward declaration
+    // Helper: collect all members from a scope, flattening generate blocks
+    auto collectMembers = [](auto& self, const slang::ast::Scope& scope,
+                             std::vector<const slang::ast::Symbol*>& out) -> void {
+        for (auto& member : scope.members()) {
+            if (member.kind == slang::ast::SymbolKind::GenerateBlock) {
+                auto& gb = member.as<slang::ast::GenerateBlockSymbol>();
+                if (!gb.isUninstantiated)
+                    self(self, gb, out);
+            } else if (member.kind == slang::ast::SymbolKind::GenerateBlockArray) {
+                auto& gba = member.as<slang::ast::GenerateBlockArraySymbol>();
+                for (auto* entry : gba.entries) {
+                    if (entry && !entry->isUninstantiated)
+                        self(self, *entry, out);
+                }
+            } else {
+                out.push_back(&member);
+            }
+        }
+    };
+
     auto lowerInstance = [&](auto& self, const slang::ast::InstanceSymbol& inst,
                              const std::string& prefix, bool isTop) -> void {
         auto& body = inst.body;
 
+        // Flatten all members including those inside generate blocks
+        std::vector<const slang::ast::Symbol*> allMembers;
+        collectMembers(collectMembers, body, allMembers);
+
         // ── Collect signals for this scope ──────────────────────────────────
 
-        // Ports
+        // Ports (these are always at the top level, not inside generate)
         for (auto& member : body.members()) {
             if (member.kind == slang::ast::SymbolKind::Port) {
                 auto& port = member.as<slang::ast::PortSymbol>();
@@ -967,8 +1007,9 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
             }
         }
 
-        // Variables and nets
-        for (auto& member : body.members()) {
+        // Variables and nets (including those inside generate blocks)
+        for (auto* memberPtr : allMembers) {
+            auto& member = *memberPtr;
             if (member.kind == slang::ast::SymbolKind::Variable) {
                 auto& var = member.as<slang::ast::VariableSymbol>();
                 // Skip if already mapped (e.g., port internal symbol)
@@ -1014,7 +1055,8 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
 
         // ── Handle child instances (recursive inline) ───────────────────────
 
-        for (auto& member : body.members()) {
+        for (auto* memberPtr : allMembers) {
+            auto& member = *memberPtr;
             if (member.kind == slang::ast::SymbolKind::Instance) {
                 auto& childInst = member.as<slang::ast::InstanceSymbol>();
                 std::string childPrefix = prefix + std::string(childInst.name) + ".";
@@ -1107,7 +1149,8 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
 
         ExprLowering exprLower(*mod, arrayMap, symbolMap);
 
-        for (auto& member : body.members()) {
+        for (auto* memberPtr : allMembers) {
+            auto& member = *memberPtr;
             if (member.kind == slang::ast::SymbolKind::ProceduralBlock) {
                 auto& pb = member.as<slang::ast::ProceduralBlockSymbol>();
                 Process proc;
