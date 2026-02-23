@@ -2,12 +2,12 @@
 
 ## What To Do Next
 
-**Sprint 17 complete.** Assignment patterns, initial blocks, always_latch.
+**Sprint 18 complete.** Conditional re-assignment bugfix, UART TX test.
 
 Next priorities:
-1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-3. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
+1. **Task output arguments**: Support tasks with `output` port bindings.
+2. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
+3. **Memory (2D arrays)**: Larger memories, block RAM modeling.
 4. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
 
 ### Project Structure
@@ -46,6 +46,7 @@ surge/
     spi_master.sv
     struct_test.sv
     func_test.sv
+    uart_tx.sv
     initial_test.sv
     param_adder.sv
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
@@ -332,6 +333,11 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 - **Initial blocks**: `ProceduralBlockKind::Initial` blocks lowered separately from always blocks. Constant-valued assignments extracted and stored as `Module::initialValues`. Runtime applies initial values to state buffer before simulation starts.
 - **always_latch**: Treated as combinational (same as always_comb).
 - New test: `initial_test.sv` — initial block sets scalar and array element values, combined with counter. Verified cycle-accurate against Verilator.
+
+### Sprint 18: Conditional Re-Assignment Fix + UART TX (complete)
+- **Critical bugfix: conditional re-assignment**: `signal <= default; if (cond) signal <= override;` patterns in sequential blocks now work correctly. Previously the conditional override was lost — the mux false-branch used `signalRef(target)` (reads current state) instead of the pending outer assignment value (the default). Fixed in both `lowerConditional` and `lowerCase`: when merging, search for pending outer assignments and use their value as the mux fallback. Also replace-in-place instead of duplicating.
+- This pattern is ubiquitous in real RTL: default output assignments at the top of always_ff blocks with conditional overrides inside case/if.
+- New test: `uart_tx.sv` — parameterized UART transmitter with FSM (IDLE/START/DATA/STOP/DONE), shift register, bit counter, self-stimulus top-level. Exercises: hierarchy, enum typedef, parameterized submodule, conditional re-assignment, `$clog2` in parameter context. Verified cycle-accurate against Verilator.
 
 ## Research
 
