@@ -4,8 +4,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SURGE="$PROJECT_DIR/build/surge"
-LFSR_SV="$PROJECT_DIR/tests/lfsr.sv"
-ALU_SV="$PROJECT_DIR/tests/alu_regfile.sv"
 
 CYCLES=${1:-1000000}
 
@@ -14,39 +12,40 @@ echo " Surge vs Verilator Benchmark"
 echo "=========================================="
 echo ""
 
-# ── LFSR Benchmark ─────────────────────────────────────────────────────────
+# ── Design list ───────────────────────────────────────────────────────────────
 
-echo "=== Design: LFSR (8-bit Galois) ==="
-echo "Cycles: $CYCLES"
-echo ""
+declare -a DESIGNS=("lfsr" "alu_regfile_stim" "pipeline_datapath")
+declare -a LABELS=("LFSR (8-bit Galois)" "ALU+Regfile (self-stim)" "3-Stage Pipeline")
+declare -a SV_FILES=("$PROJECT_DIR/tests/lfsr.sv" "$PROJECT_DIR/tests/alu_regfile_stim.sv" "$PROJECT_DIR/tests/pipeline_datapath.sv")
+declare -a CHECK_SIGNALS=("lfsr_out" "result" "checksum")
 
-echo "--- Surge (O2) ---"
-SURGE_LFSR=$($SURGE "$LFSR_SV" --cycles "$CYCLES" 2>&1)
-echo "$SURGE_LFSR"
-echo ""
+# ── Surge Benchmarks ─────────────────────────────────────────────────────────
 
-# ── ALU + Register File Benchmark ──────────────────────────────────────────
+declare -a SURGE_RESULTS
+for i in "${!DESIGNS[@]}"; do
+    echo "=== Design: ${LABELS[$i]} ==="
+    echo "Cycles: $CYCLES"
+    echo ""
+    echo "--- Surge (O2) ---"
+    SURGE_RESULTS[$i]=$($SURGE "${SV_FILES[$i]}" --cycles "$CYCLES" 2>&1)
+    echo "${SURGE_RESULTS[$i]}"
+    echo ""
+done
 
-echo "=== Design: ALU + 8x32-bit Register File ==="
-echo "Cycles: $CYCLES"
-echo ""
-
-echo "--- Surge (O2) ---"
-SURGE_ALU=$($SURGE "$ALU_SV" --cycles "$CYCLES" 2>&1)
-echo "$SURGE_ALU"
-echo ""
-
-# ── Verilator ──────────────────────────────────────────────────────────────
+# ── Verilator Benchmarks ─────────────────────────────────────────────────────
 
 if command -v verilator &>/dev/null; then
     VERI_DIR=$(mktemp -d)
+    declare -a VERI_RESULTS
 
-    # ── Verilator LFSR ─────────────────────────────────────────────────────
-
-    echo "--- Verilator: LFSR ---"
-
-    cat > "$VERI_DIR/tb_lfsr.cpp" << 'CPPEOF'
-#include "Vlfsr.h"
+    # Helper: generate a simple clk/rst testbench for any module
+    gen_tb() {
+        local MODULE_NAME=$1
+        local HEADER_NAME=$2
+        local CHECK_SIG=$3
+        local TB_FILE=$4
+        cat > "$TB_FILE" << CPPEOF
+#include "${HEADER_NAME}.h"
 #include "verilated.h"
 #include <chrono>
 #include <cstdio>
@@ -54,12 +53,11 @@ if command -v verilator &>/dev/null; then
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
-    Vlfsr* dut = new Vlfsr;
+    ${HEADER_NAME}* dut = new ${HEADER_NAME};
 
     uint64_t cycles = 1000000;
     if (argc > 1) cycles = strtoull(argv[1], nullptr, 10);
 
-    // Reset
     dut->rst = 1;
     for (int i = 0; i < 5; i++) {
         dut->clk = 1; dut->eval();
@@ -75,7 +73,7 @@ int main(int argc, char** argv) {
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
 
-    printf("  lfsr_out = %u (0x%02x)\n", dut->lfsr_out, dut->lfsr_out);
+    printf("  ${CHECK_SIG} = %u (0x%08x)\n", dut->${CHECK_SIG}, dut->${CHECK_SIG});
     printf("  Cycles: %llu\n", (unsigned long long)cycles);
     printf("  Wall time: %.6f s\n", elapsed.count());
     printf("  Throughput: %.2f MHz\n", cycles / elapsed.count() / 1e6);
@@ -84,94 +82,53 @@ int main(int argc, char** argv) {
     return 0;
 }
 CPPEOF
-
-    verilator --cc "$LFSR_SV" \
-        --exe "$VERI_DIR/tb_lfsr.cpp" \
-        -Mdir "$VERI_DIR/obj_dir_lfsr" \
-        --build -j 4 \
-        -CFLAGS "-O2" 2>/dev/null
-
-    VERI_LFSR=$("$VERI_DIR/obj_dir_lfsr/Vlfsr" "$CYCLES")
-    echo "$VERI_LFSR"
-    echo ""
-
-    # ── Verilator ALU ──────────────────────────────────────────────────────
-
-    echo "--- Verilator: ALU + Regfile ---"
-
-    cat > "$VERI_DIR/tb_alu.cpp" << 'CPPEOF'
-#include "Valu_regfile.h"
-#include "verilated.h"
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-
-int main(int argc, char** argv) {
-    Verilated::commandArgs(argc, argv);
-    Valu_regfile* dut = new Valu_regfile;
-
-    uint64_t cycles = 1000000;
-    if (argc > 1) cycles = strtoull(argv[1], nullptr, 10);
-
-    // Reset
-    dut->rst = 1;
-    dut->op = 0; dut->rd = 0; dut->rs1 = 0; dut->rs2 = 0; dut->imm = 0;
-    for (int i = 0; i < 5; i++) {
-        dut->clk = 1; dut->eval();
-        dut->clk = 0; dut->eval();
     }
-    dut->rst = 0;
 
-    auto start = std::chrono::high_resolution_clock::now();
-    for (uint64_t i = 0; i < cycles; i++) {
-        dut->clk = 1; dut->eval();
-        dut->clk = 0; dut->eval();
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
+    for i in "${!DESIGNS[@]}"; do
+        MODULE_NAME="${DESIGNS[$i]}"
+        HEADER_NAME="V${MODULE_NAME}"
+        CHECK_SIG="${CHECK_SIGNALS[$i]}"
+        TB_FILE="$VERI_DIR/tb_${MODULE_NAME}.cpp"
+        OBJ_DIR="$VERI_DIR/obj_dir_${MODULE_NAME}"
 
-    printf("  result = %u (0x%08x)\n", dut->result, dut->result);
-    printf("  Cycles: %llu\n", (unsigned long long)cycles);
-    printf("  Wall time: %.6f s\n", elapsed.count());
-    printf("  Throughput: %.2f MHz\n", cycles / elapsed.count() / 1e6);
+        echo "--- Verilator: ${LABELS[$i]} ---"
 
-    delete dut;
-    return 0;
-}
-CPPEOF
+        gen_tb "$MODULE_NAME" "$HEADER_NAME" "$CHECK_SIG" "$TB_FILE"
 
-    verilator --cc "$ALU_SV" \
-        --exe "$VERI_DIR/tb_alu.cpp" \
-        -Mdir "$VERI_DIR/obj_dir_alu" \
-        --build -j 4 \
-        -CFLAGS "-O2" 2>/dev/null
+        verilator --cc "${SV_FILES[$i]}" \
+            --exe "$TB_FILE" \
+            -Mdir "$OBJ_DIR" \
+            --build -j 4 \
+            -CFLAGS "-O2" 2>/dev/null
 
-    VERI_ALU=$("$VERI_DIR/obj_dir_alu/Valu_regfile" "$CYCLES")
-    echo "$VERI_ALU"
-    echo ""
+        VERI_RESULTS[$i]=$("$OBJ_DIR/$HEADER_NAME" "$CYCLES")
+        echo "${VERI_RESULTS[$i]}"
+        echo ""
+    done
 
     # Cleanup
     rm -rf "$VERI_DIR"
 
-    # ── Correctness Check ──────────────────────────────────────────────────
+    # ── Correctness Check ─────────────────────────────────────────────────────
 
     echo "=== Correctness Check ==="
-    SURGE_LFSR_VAL=$(echo "$SURGE_LFSR" | grep "lfsr_out" | head -1 | grep -o '0x[0-9a-f]*')
-    VERI_LFSR_VAL=$(echo "$VERI_LFSR" | grep "lfsr_out" | head -1 | grep -o '0x[0-9a-f]*')
-    echo "  LFSR: Surge=$SURGE_LFSR_VAL Verilator=$VERI_LFSR_VAL"
-    if [ "$SURGE_LFSR_VAL" = "$VERI_LFSR_VAL" ]; then
-        echo "  LFSR: PASS"
-    else
-        echo "  LFSR: FAIL"
-    fi
+    ALL_PASS=true
+    for i in "${!DESIGNS[@]}"; do
+        SIG="${CHECK_SIGNALS[$i]}"
+        SURGE_VAL=$(echo "${SURGE_RESULTS[$i]}" | grep "  ${SIG} = " | head -1 | awk '{print $3}')
+        VERI_VAL=$(echo "${VERI_RESULTS[$i]}" | grep "${SIG} = " | head -1 | awk '{print $3}')
+        echo "  ${LABELS[$i]}: Surge=$SURGE_VAL Verilator=$VERI_VAL"
+        if [ "$SURGE_VAL" = "$VERI_VAL" ]; then
+            echo "  ${LABELS[$i]}: PASS"
+        else
+            echo "  ${LABELS[$i]}: FAIL"
+            ALL_PASS=false
+        fi
+    done
 
-    SURGE_ALU_VAL=$(echo "$SURGE_ALU" | grep "  result = " | head -1 | awk '{print $3}')
-    VERI_ALU_VAL=$(echo "$VERI_ALU" | grep "result = " | head -1 | awk '{print $3}')
-    echo "  ALU:  Surge=$SURGE_ALU_VAL Verilator=$VERI_ALU_VAL"
-    if [ "$SURGE_ALU_VAL" = "$VERI_ALU_VAL" ]; then
-        echo "  ALU:  PASS"
-    else
-        echo "  ALU:  FAIL"
+    if $ALL_PASS; then
+        echo ""
+        echo "All correctness checks PASSED."
     fi
 else
     echo "Verilator not found -- skipping Verilator benchmark."

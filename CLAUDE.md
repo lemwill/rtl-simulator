@@ -2,13 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 4 complete.** Computed store optimization — ALU now 2.6x faster than Verilator.
+**Sprint 5 complete.** Self-stimulus benchmarks, 3-stage pipeline, multi-module hierarchy.
 
 Next priorities:
-1. **Testbench input driving**: Currently only clock/reset driven. Need stimulus mechanism to exercise ALU operations and produce non-trivial outputs.
-2. **Multi-module hierarchy**: Module instantiation and port binding.
-3. **Generate blocks**: Parameterized module generation.
-4. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
+1. **Generate blocks**: Parameterized module generation.
+2. **Wider benchmark designs**: More complex designs (pipelined CPU, bus arbiter) to stress-test at scale.
+3. **Combinational loop detection**: Prevent infinite loops in pure-combinational designs.
+4. **Signed arithmetic**: `signed` type handling and arithmetic right shift.
 
 ### Project Structure
 ```
@@ -36,6 +36,9 @@ surge/
     lfsr.sv
     fsm.sv
     alu_regfile.sv
+    alu_regfile_stim.sv
+    pipeline_datapath.sv
+    counter_hier.sv
   bench/
     run_bench.sh            # Surge vs Verilator benchmark
 ```
@@ -144,6 +147,24 @@ ALU regression: mux-guarded dynamic writes are 8x per register write. Needs comp
 | ALU+8x32 Regfile | 18.7 MHz | **75 MHz** | 29 MHz | **2.6x** |
 
 ALU: 4x speedup from computed store. Both designs now faster than Verilator.
+
+### Sprint 5: Self-Stimulus Benchmarks, Pipeline, Hierarchy (complete)
+- Added self-stimulus ALU benchmark (`alu_regfile_stim.sv`): embedded 32-bit LFSR generates pseudo-random op/rd/rs1/rs2/imm every cycle
+- Added 3-stage pipeline datapath (`pipeline_datapath.sv`): LFSR instruction generator, decode, ALU execute (combinational), writeback with checksum accumulator (28 signals, 12 processes)
+- Added multi-module hierarchy support: recursive inline flattening via `lowerInstance` lambda
+  - SymbolMap-based signal resolution (replaces string-based `findSignal()` for correctness)
+  - Port binding via slang `getPortConnections()` API
+  - Handles input ports (NamedValueExpression), output ports (AssignmentExpression), and Conversion wrappers
+- Test: `counter_hier.sv` — two `inner_counter` instances, both count correctly
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **132 MHz** | 40 MHz | **3.3x** | PASS |
+| ALU+Regfile (self-stim) | **65 MHz** | 27 MHz | **2.4x** | PASS |
+| 3-Stage Pipeline | **33 MHz** | 21 MHz | **1.6x** | PASS |
+
+Surge beats Verilator on all three designs with real LFSR-driven stimulus.
 
 ## Research
 

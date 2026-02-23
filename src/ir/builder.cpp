@@ -62,6 +62,7 @@ struct ArrayInfo {
 };
 
 using ArrayMap = std::unordered_map<const slang::ast::Symbol*, ArrayInfo>;
+using SymbolMap = std::unordered_map<const slang::ast::Symbol*, uint32_t>;
 
 // Check if a type is a fixed-size unpacked array.
 std::optional<std::tuple<uint32_t, uint32_t, int32_t>>
@@ -81,8 +82,8 @@ getUnpackedArrayInfo(const slang::ast::Type& type) {
 
 class ExprLowering {
 public:
-    ExprLowering(Module& mod, const ArrayMap& arrayMap)
-        : mod_(mod), arrayMap_(arrayMap) {}
+    ExprLowering(Module& mod, const ArrayMap& arrayMap, const SymbolMap& symbolMap)
+        : mod_(mod), arrayMap_(arrayMap), symbolMap_(symbolMap) {}
 
     void setLoopVarValue(const slang::ast::Symbol* sym, uint64_t val) {
         loopVarValues_[sym] = val;
@@ -123,6 +124,7 @@ public:
 private:
     Module& mod_;
     const ArrayMap& arrayMap_;
+    const SymbolMap& symbolMap_;
     std::unordered_map<const slang::ast::Symbol*, uint64_t> loopVarValues_;
 
     ExprPtr lowerIntLiteral(const slang::ast::IntegerLiteral& lit) {
@@ -161,6 +163,14 @@ private:
             return Expr::constant(1, 0);
         }
 
+        // Symbol-based resolution (supports hierarchical inlining)
+        auto symIt = symbolMap_.find(&sym);
+        if (symIt != symbolMap_.end()) {
+            auto& sig = mod_.signals[symIt->second];
+            return Expr::signalRef(sig.width, sig.index);
+        }
+
+        // Fallback: name-based resolution
         auto* sig = mod_.findSignal(std::string(sym.name));
         if (!sig) {
             std::cerr << "surge: unknown signal '" << sym.name << "'\n";
@@ -462,7 +472,8 @@ bool evaluateStopCondition(const slang::ast::Expression& stopExpr,
 
 class StmtLowering {
 public:
-    StmtLowering(Module& mod, ExprLowering& el) : mod_(mod), el_(el) {}
+    StmtLowering(Module& mod, ExprLowering& el, const SymbolMap& symbolMap)
+        : mod_(mod), el_(el), symbolMap_(symbolMap) {}
 
     void lower(const slang::ast::Statement& stmt) {
         switch (stmt.kind) {
@@ -503,6 +514,7 @@ public:
 private:
     Module& mod_;
     ExprLowering& el_;
+    const SymbolMap& symbolMap_;
     std::vector<Assignment> assignments_;
 
     void lowerExprStmt(const slang::ast::ExpressionStatement& es) {
@@ -513,18 +525,26 @@ private:
         }
     }
 
+    uint32_t resolveSignalIndex(const slang::ast::Symbol& sym) const {
+        auto it = symbolMap_.find(&sym);
+        if (it != symbolMap_.end()) return it->second;
+        auto* sig = mod_.findSignal(std::string(sym.name));
+        if (sig) return sig->index;
+        return UINT32_MAX;
+    }
+
     void lowerAssignment(const slang::ast::AssignmentExpression& ae) {
         auto& lhs = ae.left();
         auto rhs = el_.lower(ae.right());
 
         if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
             auto& nv = lhs.as<slang::ast::NamedValueExpression>();
-            auto* sig = mod_.findSignal(std::string(nv.symbol.name));
-            if (!sig) {
+            uint32_t sigIdx = resolveSignalIndex(nv.symbol);
+            if (sigIdx == UINT32_MAX) {
                 std::cerr << "surge: unknown target signal '" << nv.symbol.name << "'\n";
                 return;
             }
-            assignments_.push_back({sig->index, rhs});
+            assignments_.push_back({sigIdx, rhs});
         } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
             lowerIndexedAssignment(lhs.as<slang::ast::ElementSelectExpression>(), rhs);
         } else {
@@ -679,13 +699,13 @@ private:
         else
             cond = Expr::constant(1, 1);
 
-        StmtLowering ifLower(mod_, el_);
+        StmtLowering ifLower(mod_, el_, symbolMap_);
         ifLower.lower(cs.ifTrue);
         auto ifAssigns = std::move(ifLower.assignments());
 
         std::vector<Assignment> elseAssigns;
         if (cs.ifFalse) {
-            StmtLowering elseLower(mod_, el_);
+            StmtLowering elseLower(mod_, el_, symbolMap_);
             elseLower.lower(*cs.ifFalse);
             elseAssigns = std::move(elseLower.assignments());
         }
@@ -756,7 +776,7 @@ private:
         std::unordered_map<uint32_t, ExprPtr> currentValues;
         std::vector<Assignment> arrayStoreAccum; // accumulated array stores with conditions
         if (cs.defaultCase) {
-            StmtLowering defaultLower(mod_, el_);
+            StmtLowering defaultLower(mod_, el_, symbolMap_);
             defaultLower.lower(*cs.defaultCase);
             auto defaultAssigns = std::move(defaultLower.assignments());
             auto defaultArrayStores = extractArrayStores(defaultAssigns);
@@ -771,7 +791,7 @@ private:
         for (int i = static_cast<int>(cs.items.size()) - 1; i >= 0; i--) {
             auto& item = cs.items[i];
 
-            StmtLowering itemLower(mod_, el_);
+            StmtLowering itemLower(mod_, el_, symbolMap_);
             itemLower.lower(*item.stmt);
             auto itemAssigns = std::move(itemLower.assignments());
             auto itemArrayStores = extractArrayStores(itemAssigns);
@@ -863,172 +883,302 @@ std::unique_ptr<Module> buildFromFile(const std::string& path) {
 
     auto mod = std::make_unique<Module>();
     mod->name = std::string(topInst->name);
-    auto& body = topInst->body;
 
-    // Array metadata map
+    // Shared maps for all scopes
     ArrayMap arrayMap;
+    SymbolMap symbolMap;
 
-    // ── Pass 1: collect signals ─────────────────────────────────────────────
+    // Forward declaration
+    auto lowerInstance = [&](auto& self, const slang::ast::InstanceSymbol& inst,
+                             const std::string& prefix, bool isTop) -> void {
+        auto& body = inst.body;
 
-    for (auto& member : body.members()) {
-        if (member.kind == slang::ast::SymbolKind::Port) {
-            auto& port = member.as<slang::ast::PortSymbol>();
-            SignalKind sk;
-            switch (port.direction) {
-                case slang::ast::ArgumentDirection::In:    sk = SignalKind::Input; break;
-                case slang::ast::ArgumentDirection::Out:   sk = SignalKind::Output; break;
-                case slang::ast::ArgumentDirection::InOut:  sk = SignalKind::Output; break;
-                default: sk = SignalKind::Internal; break;
+        // ── Collect signals for this scope ──────────────────────────────────
+
+        // Ports
+        for (auto& member : body.members()) {
+            if (member.kind == slang::ast::SymbolKind::Port) {
+                auto& port = member.as<slang::ast::PortSymbol>();
+                if (isTop) {
+                    // Top-level ports become I/O signals
+                    SignalKind sk;
+                    switch (port.direction) {
+                        case slang::ast::ArgumentDirection::In:    sk = SignalKind::Input; break;
+                        case slang::ast::ArgumentDirection::Out:   sk = SignalKind::Output; break;
+                        case slang::ast::ArgumentDirection::InOut:  sk = SignalKind::Output; break;
+                        default: sk = SignalKind::Internal; break;
+                    }
+                    uint32_t w = getTypeWidth(port.getType());
+                    uint32_t idx = mod->addSignal(std::string(port.name), w, sk);
+                    symbolMap[&port] = idx;
+                    // Also map the internal symbol if it exists
+                    if (port.internalSymbol)
+                        symbolMap[port.internalSymbol] = idx;
+                }
+                // Child ports are mapped during port binding (below)
             }
-            uint32_t w = getTypeWidth(port.getType());
-            mod->addSignal(std::string(port.name), w, sk);
         }
-    }
 
-    for (auto& member : body.members()) {
-        if (member.kind == slang::ast::SymbolKind::Variable) {
-            auto& var = member.as<slang::ast::VariableSymbol>();
-            if (!mod->findSignal(std::string(var.name))) {
+        // Variables and nets
+        for (auto& member : body.members()) {
+            if (member.kind == slang::ast::SymbolKind::Variable) {
+                auto& var = member.as<slang::ast::VariableSymbol>();
+                // Skip if already mapped (e.g., port internal symbol)
+                if (symbolMap.count(&var)) continue;
                 auto arrInfo = getUnpackedArrayInfo(var.getType());
                 if (arrInfo) {
                     auto [elemWidth, arrSize, rangeLower] = *arrInfo;
                     uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
                     for (uint32_t i = 0; i < arrSize; i++) {
-                        std::string elemName = std::string(var.name) + "[" + std::to_string(i) + "]";
+                        std::string elemName = prefix + std::string(var.name)
+                            + "[" + std::to_string(i) + "]";
                         mod->addSignal(elemName, elemWidth, SignalKind::Internal);
                     }
                     arrayMap[&var] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
                 } else {
                     uint32_t w = getTypeWidth(var.getType());
-                    mod->addSignal(std::string(var.name), w, SignalKind::Internal);
+                    uint32_t idx = mod->addSignal(prefix + std::string(var.name),
+                                                   w, SignalKind::Internal);
+                    symbolMap[&var] = idx;
                 }
             }
-        }
-        if (member.kind == slang::ast::SymbolKind::Net) {
-            auto& net = member.as<slang::ast::NetSymbol>();
-            if (!mod->findSignal(std::string(net.name))) {
+            if (member.kind == slang::ast::SymbolKind::Net) {
+                auto& net = member.as<slang::ast::NetSymbol>();
+                if (symbolMap.count(&net)) continue;
                 auto arrInfo = getUnpackedArrayInfo(net.getType());
                 if (arrInfo) {
                     auto [elemWidth, arrSize, rangeLower] = *arrInfo;
                     uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
                     for (uint32_t i = 0; i < arrSize; i++) {
-                        std::string elemName = std::string(net.name) + "[" + std::to_string(i) + "]";
+                        std::string elemName = prefix + std::string(net.name)
+                            + "[" + std::to_string(i) + "]";
                         mod->addSignal(elemName, elemWidth, SignalKind::Internal);
                     }
                     arrayMap[&net] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
                 } else {
                     uint32_t w = getTypeWidth(net.getType());
-                    mod->addSignal(std::string(net.name), w, SignalKind::Internal);
+                    uint32_t idx = mod->addSignal(prefix + std::string(net.name),
+                                                   w, SignalKind::Internal);
+                    symbolMap[&net] = idx;
                 }
             }
         }
-    }
 
-    // ── Pass 2: lower processes ─────────────────────────────────────────────
+        // ── Handle child instances (recursive inline) ───────────────────────
 
-    ExprLowering exprLower(*mod, arrayMap);
+        for (auto& member : body.members()) {
+            if (member.kind == slang::ast::SymbolKind::Instance) {
+                auto& childInst = member.as<slang::ast::InstanceSymbol>();
+                std::string childPrefix = prefix + std::string(childInst.name) + ".";
 
-    for (auto& member : body.members()) {
-        if (member.kind == slang::ast::SymbolKind::ProceduralBlock) {
-            auto& pb = member.as<slang::ast::ProceduralBlockSymbol>();
-            Process proc;
-
-            if (pb.procedureKind == slang::ast::ProceduralBlockKind::AlwaysFF) {
-                proc.kind = Process::Sequential;
-                auto* clkSig = mod->findSignal("clk");
-                if (clkSig) {
-                    proc.clockSignalIndex = clkSig->index;
-                    proc.clockEdge = EdgeKind::Posedge;
-                }
-            } else {
-                proc.kind = Process::Combinational;
-            }
-
-            StmtLowering stmtLower(*mod, exprLower);
-            stmtLower.lower(pb.getBody());
-            proc.assignments = std::move(stmtLower.assignments());
-
-            if (proc.kind == Process::Sequential) {
-                for (auto& a : proc.assignments) {
-                    if (a.indexExpr) {
-                        // Array store: mark all elements as FFs
-                        for (uint32_t i = 0; i < a.arraySize; i++)
-                            mod->signals[a.targetIndex + i].isFF = true;
-                    } else {
-                        mod->signals[a.targetIndex].isFF = true;
+                // Helper: map a child port (and its internal symbols) to a signal index
+                auto mapChildPort = [&](const slang::ast::Symbol& portSym,
+                                        uint32_t sigIdx) {
+                    symbolMap[&portSym] = sigIdx;
+                    // Map the port's internal symbol
+                    if (portSym.kind == slang::ast::SymbolKind::Port) {
+                        auto& ps = portSym.as<slang::ast::PortSymbol>();
+                        if (ps.internalSymbol)
+                            symbolMap[ps.internalSymbol] = sigIdx;
                     }
-                }
-            }
-
-            mod->processes.push_back(std::move(proc));
-        }
-
-        if (member.kind == slang::ast::SymbolKind::ContinuousAssign) {
-            auto& ca = member.as<slang::ast::ContinuousAssignSymbol>();
-            auto& assign = ca.getAssignment();
-
-            Process proc;
-            proc.kind = Process::Combinational;
-
-            if (assign.kind == slang::ast::ExpressionKind::Assignment) {
-                auto& ae = assign.as<slang::ast::AssignmentExpression>();
-                auto& lhs = ae.left();
-                if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
-                    auto& nv = lhs.as<slang::ast::NamedValueExpression>();
-                    auto* sig = mod->findSignal(std::string(nv.symbol.name));
-                    if (sig) {
-                        auto rhs = exprLower.lower(ae.right());
-                        proc.assignments.push_back({sig->index, rhs});
+                    // Also search the child body for any variable/net matching
+                    // the port name (robust against internalSymbol mismatches)
+                    auto& childBody = childInst.body;
+                    for (auto& m : childBody.members()) {
+                        if (m.kind == slang::ast::SymbolKind::Variable
+                            && m.name == portSym.name) {
+                            symbolMap[&m] = sigIdx;
+                        }
+                        if (m.kind == slang::ast::SymbolKind::Net
+                            && m.name == portSym.name) {
+                            symbolMap[&m] = sigIdx;
+                        }
                     }
-                } else if (lhs.kind == slang::ast::ExpressionKind::Concatenation) {
-                    auto& cc = lhs.as<slang::ast::ConcatenationExpression>();
-                    auto rhs = exprLower.lower(ae.right());
-                    std::vector<std::pair<const slang::ast::Expression*, uint32_t>> targets;
-                    for (auto* op : cc.operands())
-                        targets.push_back({op, getTypeWidth(*op->type)});
-                    uint32_t bitPos = 0;
-                    for (int i = static_cast<int>(targets.size()) - 1; i >= 0; i--) {
-                        auto [tExpr, tWidth] = targets[i];
-                        if (tExpr->kind == slang::ast::ExpressionKind::NamedValue) {
-                            auto& nv = tExpr->as<slang::ast::NamedValueExpression>();
-                            auto* sig = mod->findSignal(std::string(nv.symbol.name));
-                            if (sig) {
-                                auto sliced = Expr::slice(tWidth, rhs,
-                                    bitPos + tWidth - 1, bitPos);
-                                proc.assignments.push_back({sig->index, sliced});
+                };
+
+                // Port binding: map child ports to parent signals
+                auto connections = childInst.getPortConnections();
+                for (const auto* conn : connections) {
+                    auto& portSym = conn->port;
+                    const auto* connExpr = conn->getExpression();
+
+                    // Extract the parent signal symbol from the connection expression
+                    const slang::ast::Symbol* parentSym = nullptr;
+                    if (connExpr) {
+                        if (connExpr->kind == slang::ast::ExpressionKind::NamedValue) {
+                            parentSym = &connExpr->as<slang::ast::NamedValueExpression>().symbol;
+                        } else if (connExpr->kind == slang::ast::ExpressionKind::Assignment) {
+                            // Output port: slang creates assignment expr (parent_var = port)
+                            auto& ae = connExpr->as<slang::ast::AssignmentExpression>();
+                            if (ae.left().kind == slang::ast::ExpressionKind::NamedValue)
+                                parentSym = &ae.left().as<slang::ast::NamedValueExpression>().symbol;
+                        } else if (connExpr->kind == slang::ast::ExpressionKind::Conversion) {
+                            auto& inner = connExpr->as<slang::ast::ConversionExpression>().operand();
+                            if (inner.kind == slang::ast::ExpressionKind::NamedValue)
+                                parentSym = &inner.as<slang::ast::NamedValueExpression>().symbol;
+                        }
+                    }
+
+                    if (parentSym) {
+                        // Simple named connection: child port maps to parent signal
+                        auto parentIt = symbolMap.find(parentSym);
+                        if (parentIt != symbolMap.end()) {
+                            mapChildPort(portSym, parentIt->second);
+                        } else {
+                            auto* parentSig = mod->findSignal(std::string(parentSym->name));
+                            if (parentSig) {
+                                mapChildPort(portSym, parentSig->index);
+                            } else {
+                                std::cerr << "surge: cannot resolve port connection for '"
+                                          << portSym.name << "'\n";
                             }
                         }
-                        bitPos += tWidth;
+                    } else if (connExpr) {
+                        // Complex expression connection: create an internal signal
+                        uint32_t w = getTypeWidth(connExpr->type->getCanonicalType());
+                        uint32_t idx = mod->addSignal(childPrefix + std::string(portSym.name),
+                                                       w, SignalKind::Internal);
+                        mapChildPort(portSym, idx);
+                    } else {
+                        // Unconnected port: create a dummy signal
+                        uint32_t w = 1;
+                        if (portSym.kind == slang::ast::SymbolKind::Port)
+                            w = getTypeWidth(portSym.as<slang::ast::PortSymbol>().getType());
+                        uint32_t idx = mod->addSignal(childPrefix + std::string(portSym.name),
+                                                       w, SignalKind::Internal);
+                        mapChildPort(portSym, idx);
                     }
-                } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
-                    // Continuous assignment with indexed LHS (e.g., assign arr[0] = ...)
-                    auto& es = lhs.as<slang::ast::ElementSelectExpression>();
-                    auto rhs = exprLower.lower(ae.right());
-                    const slang::ast::Symbol* baseSym = nullptr;
-                    if (es.value().kind == slang::ast::ExpressionKind::NamedValue)
-                        baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
-                    if (baseSym) {
-                        auto arrIt = arrayMap.find(baseSym);
-                        if (arrIt != arrayMap.end()) {
-                            auto& info = arrIt->second;
-                            auto constIdx = extractConstantInt(es.selector());
-                            if (constIdx) {
-                                uint32_t idx = static_cast<uint32_t>(*constIdx)
-                                    - static_cast<uint32_t>(info.rangeLower);
-                                if (idx < info.size) {
-                                    proc.assignments.push_back(
-                                        {info.baseSignalIndex + idx, rhs});
+                }
+
+                // Recurse into child instance
+                self(self, childInst, childPrefix, false);
+            }
+        }
+
+        // ── Lower processes ─────────────────────────────────────────────────
+
+        ExprLowering exprLower(*mod, arrayMap, symbolMap);
+
+        for (auto& member : body.members()) {
+            if (member.kind == slang::ast::SymbolKind::ProceduralBlock) {
+                auto& pb = member.as<slang::ast::ProceduralBlockSymbol>();
+                Process proc;
+
+                if (pb.procedureKind == slang::ast::ProceduralBlockKind::AlwaysFF) {
+                    proc.kind = Process::Sequential;
+                    // Find the clock signal for this scope
+                    auto* clkSig = mod->findSignal(prefix.empty() ? "clk" : prefix + "clk");
+                    if (!clkSig) clkSig = mod->findSignal("clk"); // fallback to top-level clk
+                    if (clkSig) {
+                        proc.clockSignalIndex = clkSig->index;
+                        proc.clockEdge = EdgeKind::Posedge;
+                    }
+                } else {
+                    proc.kind = Process::Combinational;
+                }
+
+                StmtLowering stmtLower(*mod, exprLower, symbolMap);
+                stmtLower.lower(pb.getBody());
+                proc.assignments = std::move(stmtLower.assignments());
+
+                if (proc.kind == Process::Sequential) {
+                    for (auto& a : proc.assignments) {
+                        if (a.indexExpr) {
+                            for (uint32_t i = 0; i < a.arraySize; i++)
+                                mod->signals[a.targetIndex + i].isFF = true;
+                        } else {
+                            mod->signals[a.targetIndex].isFF = true;
+                        }
+                    }
+                }
+
+                mod->processes.push_back(std::move(proc));
+            }
+
+            if (member.kind == slang::ast::SymbolKind::ContinuousAssign) {
+                auto& ca = member.as<slang::ast::ContinuousAssignSymbol>();
+                auto& assign = ca.getAssignment();
+
+                Process proc;
+                proc.kind = Process::Combinational;
+
+                if (assign.kind == slang::ast::ExpressionKind::Assignment) {
+                    auto& ae = assign.as<slang::ast::AssignmentExpression>();
+                    auto& lhs = ae.left();
+                    if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
+                        auto& nv = lhs.as<slang::ast::NamedValueExpression>();
+                        // Use symbolMap for LHS resolution
+                        auto symIt = symbolMap.find(&nv.symbol);
+                        uint32_t sigIdx = UINT32_MAX;
+                        if (symIt != symbolMap.end()) {
+                            sigIdx = symIt->second;
+                        } else {
+                            auto* sig = mod->findSignal(std::string(nv.symbol.name));
+                            if (sig) sigIdx = sig->index;
+                        }
+                        if (sigIdx != UINT32_MAX) {
+                            auto rhs = exprLower.lower(ae.right());
+                            proc.assignments.push_back({sigIdx, rhs});
+                        }
+                    } else if (lhs.kind == slang::ast::ExpressionKind::Concatenation) {
+                        auto& cc = lhs.as<slang::ast::ConcatenationExpression>();
+                        auto rhs = exprLower.lower(ae.right());
+                        std::vector<std::pair<const slang::ast::Expression*, uint32_t>> targets;
+                        for (auto* op : cc.operands())
+                            targets.push_back({op, getTypeWidth(*op->type)});
+                        uint32_t bitPos = 0;
+                        for (int i = static_cast<int>(targets.size()) - 1; i >= 0; i--) {
+                            auto [tExpr, tWidth] = targets[i];
+                            if (tExpr->kind == slang::ast::ExpressionKind::NamedValue) {
+                                auto& nv = tExpr->as<slang::ast::NamedValueExpression>();
+                                auto symIt = symbolMap.find(&nv.symbol);
+                                uint32_t sigIdx = UINT32_MAX;
+                                if (symIt != symbolMap.end()) sigIdx = symIt->second;
+                                else {
+                                    auto* sig = mod->findSignal(std::string(nv.symbol.name));
+                                    if (sig) sigIdx = sig->index;
+                                }
+                                if (sigIdx != UINT32_MAX) {
+                                    auto sliced = Expr::slice(tWidth, rhs,
+                                        bitPos + tWidth - 1, bitPos);
+                                    proc.assignments.push_back({sigIdx, sliced});
+                                }
+                            }
+                            bitPos += tWidth;
+                        }
+                    } else if (lhs.kind == slang::ast::ExpressionKind::ElementSelect) {
+                        auto& es = lhs.as<slang::ast::ElementSelectExpression>();
+                        auto rhs = exprLower.lower(ae.right());
+                        const slang::ast::Symbol* baseSym = nullptr;
+                        if (es.value().kind == slang::ast::ExpressionKind::NamedValue)
+                            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
+                        if (baseSym) {
+                            auto arrIt = arrayMap.find(baseSym);
+                            if (arrIt != arrayMap.end()) {
+                                auto& info = arrIt->second;
+                                auto constIdx = extractConstantInt(es.selector());
+                                if (constIdx) {
+                                    uint32_t idx = static_cast<uint32_t>(*constIdx)
+                                        - static_cast<uint32_t>(info.rangeLower);
+                                    if (idx < info.size) {
+                                        proc.assignments.push_back(
+                                            {info.baseSignalIndex + idx, rhs});
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            if (!proc.assignments.empty())
-                mod->processes.push_back(std::move(proc));
+                if (!proc.assignments.empty())
+                    mod->processes.push_back(std::move(proc));
+            }
         }
-    }
+    };
+
+    // ── Recursively inline from the top instance ────────────────────────────
+
+    lowerInstance(lowerInstance, *topInst, "", true);
 
     mod->computeLayout();
 
