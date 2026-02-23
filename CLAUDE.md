@@ -2,10 +2,10 @@
 
 ## What To Do Next
 
-**Sprint 10 complete.** Packed bit assignment, dynamic range select/assign, comb settle bugfix, unsigned `>>>` fix.
+**Sprint 11 complete.** System functions, dead signal elimination, parameterized FIFO.
 
 Next priorities:
-1. **Dead signal elimination**: Remove signals not read by any process or output.
+1. **While loops / do-while**: Procedural loops (not just for).
 2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
 3. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
 4. **Wider test coverage**: More complex SV patterns (always_latch, tri-state, etc.)
@@ -41,6 +41,7 @@ surge/
     counter_hier.sv
     riscv_pipeline.sv
     barrel_shifter.sv
+    fifo.sv
     param_adder.sv
     generate_chain.sv
     enum_fsm.sv
@@ -241,6 +242,21 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | ALU+Regfile | **128 MHz** | 33 MHz | **3.9x** | PASS |
 | RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
 | Barrel Shifter | **138 MHz** | — | — | PASS |
+
+### Sprint 11: System Functions + Dead Signal Elimination (complete)
+- **System function expansion**: `$countones` via new `UnaryOp::Popcount` + LLVM `ctpop` intrinsic. `$onehot`/`$onehot0` via popcount comparison. `$isunknown` → constant 0 (2-state sim). Generic `getConstant()` fallback for compile-time system functions (`$clog2`, `$bits`, etc.).
+- **Unbased unsized integer literals**: `'0`, `'1` — `UnbasedUnsizedIntegerLiteral` expression handling.
+- **Dead signal elimination**: BFS-based liveness analysis from output/input/clock roots. Removes assignments to signals not transitively referenced by any live signal. Called automatically before codegen.
+- New test: `fifo.sv` — parameterized synchronous FIFO with `$clog2`, pointer arithmetic, full/empty flags, LFSR self-stimulus, checksum accumulator. 20 signals, 10 processes, 56 bytes. Verified cycle-accurate against Verilator.
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **268 MHz** | 23 MHz | **11.6x** | PASS |
+| ALU+Regfile | **128 MHz** | 33 MHz | **3.9x** | PASS |
+| RISC-V 5-Stage | **67 MHz** | 15 MHz | **4.5x** | PASS |
+| Barrel Shifter | **138 MHz** | — | — | PASS |
+| FIFO (8x32) | **87 MHz** | — | — | PASS |
 
 ## Research
 
