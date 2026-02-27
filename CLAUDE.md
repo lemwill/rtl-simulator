@@ -2,7 +2,7 @@
 
 ## What To Do Next
 
-**Sprint 21 complete.** Sign extension fix, 2D arrays.
+**Sprint 22 complete.** Interface support.
 
 Next priorities:
 1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
@@ -50,6 +50,7 @@ surge/
     param_adder.sv
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
+    iface_bus.sv
     enum_fsm.sv
     mem2d_test.sv
   bench/
@@ -363,6 +364,12 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | CRC-32 | **59 MHz** | — | — | PASS |
 | SPI Master | **132 MHz** | — | — | PASS |
 | 2D Memory 4x4 | **109 MHz** | — | — | PASS |
+
+### Sprint 22: Interface Support (complete)
+- **SystemVerilog interfaces**: Interface instances create signals for each member variable/net (e.g., `simple_bus bus()` creates `bus.data`, `bus.valid`, `bus.ready`). Interface port binding via `InterfacePortSymbol::getConnection()` maps child module ports to parent interface instance members.
+- **HierarchicalValueExpression**: slang represents interface member access (`bus.data` inside child modules) as `HierarchicalValueExpression` (kind=9), not `MemberAccessExpression` (kind=20). Both extend `ValueExpressionBase` with the same `symbol` member. Added `HierarchicalValue` case alongside `NamedValue` in `lower()`, `lowerAssignment()`, `resolveArrayAccess()`, `lowerRangeAssignment()`, `lowerMemberAssignment()`, continuous assign LHS, and `unwrapNamedSymbol()`.
+- **MemberAccess fallback**: `lowerMemberAccess()`/`lowerMemberAssignment()` retain interface port resolution via `InterfacePortSymbol::getConnection()` as fallback path.
+- New test: `iface_bus.sv` — `simple_bus` interface with producer/consumer modules, interface member read/write across hierarchy. Verified cycle-accurate against Verilator (result=0x13 at 20 cycles).
 
 ## Research
 
