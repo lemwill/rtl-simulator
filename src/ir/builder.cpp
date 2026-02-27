@@ -1099,7 +1099,14 @@ private:
         StmtLowering bodyLower(mod_, el_, symbolMap_, /*trackBlockValues=*/true);
         bodyLower.lower(sub->getBody());
 
-        // Write back output arguments
+        // Merge task body assignments into parent (direct writes to module signals)
+        for (auto& a : bodyLower.assignments()) {
+            assignments_.push_back(std::move(a));
+            if (trackBlockValues_ && !a.indexExpr)
+                el_.setBlockValue(a.targetIndex, a.value);
+        }
+
+        // Write back output arguments (formal out/inout params → actual args)
         for (auto& ob : outputBindings) {
             ExprPtr outVal;
             auto bvIt = el_.blockValues().find(ob.formalSigIdx);
@@ -1807,10 +1814,54 @@ private:
             auto itemArrayStores = extractArrayStores(itemAssigns);
 
             // Build condition: selector == expr1 || selector == expr2 || ...
+            // For casez/casex, use masked comparison to handle wildcard bits.
+            bool isWildcard = (cs.condition == slang::ast::CaseStatementCondition::WildcardJustZ ||
+                               cs.condition == slang::ast::CaseStatementCondition::WildcardXOrZ);
             ExprPtr cond;
             for (auto* matchExpr : item.expressions) {
-                auto matchVal = el_.lower(*matchExpr);
-                auto eq = Expr::binary(BinaryOp::Eq, 1, selectorExpr, matchVal);
+                ExprPtr eq;
+                if (isWildcard) {
+                    // Try to extract wildcard mask from constant pattern.
+                    // First try getConstant(), then fall back to IntegerLiteral::getValue()
+                    // (wildcard patterns may not have a pre-computed constant).
+                    // Try to get the SVInt for the pattern.
+                    // First try getConstant(), then fall back to IntegerLiteral::getValue()
+                    // (wildcard patterns may not have a pre-computed constant).
+                    std::optional<slang::SVInt> svHolder;
+                    auto* cv = matchExpr->getConstant();
+                    if (cv && cv->isInteger())
+                        svHolder = cv->integer();
+                    else if (matchExpr->kind == slang::ast::ExpressionKind::IntegerLiteral)
+                        svHolder = matchExpr->as<slang::ast::IntegerLiteral>().getValue();
+                    if (svHolder && svHolder->hasUnknown()) {
+                        auto& sv = *svHolder;
+                        uint32_t w = sv.getBitWidth();
+                        // Build known-bits mask and pattern from individual bits
+                        uint64_t knownMask = 0;
+                        uint64_t patternVal = 0;
+                        for (uint32_t b = 0; b < w && b < 64; b++) {
+                            auto bit = sv[static_cast<int32_t>(b)];
+                            if (!bit.isUnknown()) {
+                                knownMask |= (1ULL << b);
+                                if (bit.value == 1)
+                                    patternVal |= (1ULL << b);
+                            }
+                        }
+                        // (selector & knownMask) == patternVal
+                        auto maskConst = Expr::constant(selectorExpr->width, knownMask);
+                        auto patConst = Expr::constant(selectorExpr->width, patternVal);
+                        auto masked = Expr::binary(BinaryOp::And, selectorExpr->width,
+                                                   selectorExpr, maskConst);
+                        eq = Expr::binary(BinaryOp::Eq, 1, masked, patConst);
+                    } else {
+                        // No wildcard bits in this pattern — normal equality
+                        auto matchVal = el_.lower(*matchExpr);
+                        eq = Expr::binary(BinaryOp::Eq, 1, selectorExpr, matchVal);
+                    }
+                } else {
+                    auto matchVal = el_.lower(*matchExpr);
+                    eq = Expr::binary(BinaryOp::Eq, 1, selectorExpr, matchVal);
+                }
                 if (!cond)
                     cond = eq;
                 else
@@ -2075,6 +2126,8 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                     slang::ast::DefinitionKind::Interface)
                     continue;
                 std::string ifacePrefix = prefix + std::string(inst.name) + ".";
+                // Build a name→signalIndex map for this interface instance
+                std::unordered_map<std::string_view, uint32_t> ifaceMemberMap;
                 for (auto& m : inst.body.members()) {
                     if (m.kind == slang::ast::SymbolKind::Variable) {
                         auto& var = m.as<slang::ast::VariableSymbol>();
@@ -2082,6 +2135,7 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                         uint32_t idx = mod->addSignal(ifacePrefix + std::string(var.name),
                                                        w, SignalKind::Internal);
                         symbolMap[&var] = idx;
+                        ifaceMemberMap[var.name] = idx;
                     }
                     if (m.kind == slang::ast::SymbolKind::Net) {
                         auto& net = m.as<slang::ast::NetSymbol>();
@@ -2089,6 +2143,28 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                         uint32_t idx = mod->addSignal(ifacePrefix + std::string(net.name),
                                                        w, SignalKind::Internal);
                         symbolMap[&net] = idx;
+                        ifaceMemberMap[net.name] = idx;
+                    }
+                    // Also register modport port symbols so that child modules
+                    // using modport-qualified interface ports can resolve them.
+                    if (m.kind == slang::ast::SymbolKind::Modport) {
+                        auto& mp = m.as<slang::ast::ModportSymbol>();
+                        for (auto& mpm : mp.members()) {
+                            if (mpm.kind == slang::ast::SymbolKind::ModportPort) {
+                                auto& mpp = mpm.as<slang::ast::ModportPortSymbol>();
+                                // Map the ModportPort's internalSymbol to the
+                                // interface instance member signal
+                                if (mpp.internalSymbol) {
+                                    auto nameIt = ifaceMemberMap.find(mpp.name);
+                                    if (nameIt != ifaceMemberMap.end())
+                                        symbolMap[mpp.internalSymbol] = nameIt->second;
+                                }
+                                // Also map the ModportPort symbol itself
+                                auto nameIt = ifaceMemberMap.find(mpp.name);
+                                if (nameIt != ifaceMemberMap.end())
+                                    symbolMap[&mpp] = nameIt->second;
+                            }
+                        }
                     }
                 }
             }
