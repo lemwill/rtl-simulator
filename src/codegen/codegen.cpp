@@ -711,6 +711,9 @@ private:
                 auto* pop = builder_.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, a);
                 return builder_.CreateZExtOrTrunc(pop, intTy(w));
             }
+            case ir::UnaryOp::SignExtend: {
+                return builder_.CreateSExt(a, intTy(w));
+            }
         }
         return a; // unreachable
     }
