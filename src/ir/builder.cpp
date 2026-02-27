@@ -155,7 +155,10 @@ public:
                 return Expr::constant(getTypeWidth(*lit.type), v);
             }
             case slang::ast::ExpressionKind::NamedValue:
-                return lowerNamedValue(expr.as<slang::ast::NamedValueExpression>());
+            case slang::ast::ExpressionKind::HierarchicalValue:
+                // Both NamedValue and HierarchicalValue extend ValueExpressionBase.
+                // HierarchicalValue is used for interface member access.
+                return lowerNamedValue(static_cast<const slang::ast::ValueExpressionBase&>(expr));
             case slang::ast::ExpressionKind::UnaryOp:
                 return lowerUnary(expr.as<slang::ast::UnaryExpression>());
             case slang::ast::ExpressionKind::BinaryOp:
@@ -213,8 +216,9 @@ public:
             revSelectors.push_back(&sel.selector());
             cur = &sel.value();
         }
-        if (cur->kind == slang::ast::ExpressionKind::NamedValue) {
-            result.baseSym = &cur->as<slang::ast::NamedValueExpression>().symbol;
+        if (cur->kind == slang::ast::ExpressionKind::NamedValue ||
+            cur->kind == slang::ast::ExpressionKind::HierarchicalValue) {
+            result.baseSym = &static_cast<const slang::ast::ValueExpressionBase&>(*cur).symbol;
         }
         result.selectors.assign(revSelectors.rbegin(), revSelectors.rend());
         return result;
@@ -236,7 +240,7 @@ private:
         return Expr::constant(getTypeWidth(*lit.type), v);
     }
 
-    ExprPtr lowerNamedValue(const slang::ast::NamedValueExpression& nv) {
+    ExprPtr lowerNamedValue(const slang::ast::ValueExpressionBase& nv) {
         auto& sym = nv.symbol;
 
         // Check if this is a loop variable with a known constant value
@@ -514,8 +518,37 @@ private:
     }
 
     ExprPtr lowerMemberAccess(const slang::ast::MemberAccessExpression& ma) {
-        auto src = lower(ma.value());
         uint32_t fieldWidth = getTypeWidth(*ma.type);
+
+        // Interface member access: the member symbol maps directly to a signal
+        auto it = symbolMap_.find(&ma.member);
+        if (it != symbolMap_.end())
+            return Expr::signalRef(fieldWidth, it->second);
+
+        // Interface port member access: ma.value() is a NamedValue referencing
+        // an InterfacePortSymbol. Resolve through the interface connection
+        // to find the member signal by name.
+        if (ma.value().kind == slang::ast::ExpressionKind::NamedValue) {
+            auto& nv = ma.value().as<slang::ast::NamedValueExpression>();
+            if (nv.symbol.kind == slang::ast::SymbolKind::InterfacePort) {
+                auto& ifacePort = nv.symbol.as<slang::ast::InterfacePortSymbol>();
+                auto ifaceConn = ifacePort.getConnection();
+                const slang::ast::Symbol* ifaceInst = ifaceConn.first;
+                if (ifaceInst && ifaceInst->kind == slang::ast::SymbolKind::Instance) {
+                    // Find the member by name in the interface instance body
+                    auto& ifaceBody = ifaceInst->as<slang::ast::InstanceSymbol>().body;
+                    for (auto& m : ifaceBody.members()) {
+                        if (m.name == ma.member.name) {
+                            auto mIt = symbolMap_.find(&m);
+                            if (mIt != symbolMap_.end())
+                                return Expr::signalRef(fieldWidth, mIt->second);
+                        }
+                    }
+                }
+            }
+        }
+
+        auto src = lower(ma.value());
 
         // For packed structs, field access is a bit slice
         if (ma.member.kind == slang::ast::SymbolKind::Field) {
@@ -759,10 +792,11 @@ private:
 
 // ── For-loop helpers ────────────────────────────────────────────────────────
 
-// Unwrap NamedValue from possible Conversion wrappers.
+// Unwrap NamedValue/HierarchicalValue from possible Conversion wrappers.
 const slang::ast::Symbol* unwrapNamedSymbol(const slang::ast::Expression& expr) {
-    if (expr.kind == slang::ast::ExpressionKind::NamedValue)
-        return &expr.as<slang::ast::NamedValueExpression>().symbol;
+    if (expr.kind == slang::ast::ExpressionKind::NamedValue ||
+        expr.kind == slang::ast::ExpressionKind::HierarchicalValue)
+        return &static_cast<const slang::ast::ValueExpressionBase&>(expr).symbol;
     if (expr.kind == slang::ast::ExpressionKind::Conversion)
         return unwrapNamedSymbol(expr.as<slang::ast::ConversionExpression>().operand());
     return nullptr;
@@ -1094,8 +1128,9 @@ private:
         auto& lhs = ae.left();
         auto rhs = el_.lower(ae.right());
 
-        if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
-            auto& nv = lhs.as<slang::ast::NamedValueExpression>();
+        if (lhs.kind == slang::ast::ExpressionKind::NamedValue ||
+            lhs.kind == slang::ast::ExpressionKind::HierarchicalValue) {
+            auto& nv = static_cast<const slang::ast::ValueExpressionBase&>(lhs);
             uint32_t sigIdx = resolveSignalIndex(nv.symbol);
             if (sigIdx == UINT32_MAX) {
                 std::cerr << "surge: unknown target signal '" << nv.symbol.name << "'\n";
@@ -1248,8 +1283,9 @@ private:
         // Packed range assignment: sig[hi:lo] <= rhs or sig[start+:W] <= rhs
         // Becomes: sig <= (sig & ~(mask << lo)) | ((rhs & mask) << lo)
         const slang::ast::Symbol* baseSym = nullptr;
-        if (rs.value().kind == slang::ast::ExpressionKind::NamedValue) {
-            baseSym = &rs.value().as<slang::ast::NamedValueExpression>().symbol;
+        if (rs.value().kind == slang::ast::ExpressionKind::NamedValue ||
+            rs.value().kind == slang::ast::ExpressionKind::HierarchicalValue) {
+            baseSym = &static_cast<const slang::ast::ValueExpressionBase&>(rs.value()).symbol;
         }
         if (!baseSym) {
             std::cerr << "surge: unsupported range assignment base\n";
@@ -1303,6 +1339,41 @@ private:
     }
 
     void lowerMemberAssignment(const slang::ast::MemberAccessExpression& ma, ExprPtr rhs) {
+        // Interface member assignment: the member symbol maps directly to a signal
+        auto it = symbolMap_.find(&ma.member);
+        if (it != symbolMap_.end()) {
+            uint32_t sigIdx = it->second;
+            assignments_.push_back({sigIdx, rhs});
+            if (trackBlockValues_)
+                el_.setBlockValue(sigIdx, rhs);
+            return;
+        }
+
+        // Interface port member assignment: resolve through interface connection
+        if (ma.value().kind == slang::ast::ExpressionKind::NamedValue) {
+            auto& nv = ma.value().as<slang::ast::NamedValueExpression>();
+            if (nv.symbol.kind == slang::ast::SymbolKind::InterfacePort) {
+                auto& ifacePort = nv.symbol.as<slang::ast::InterfacePortSymbol>();
+                auto ifaceConn = ifacePort.getConnection();
+                const slang::ast::Symbol* ifaceInst = ifaceConn.first;
+                if (ifaceInst && ifaceInst->kind == slang::ast::SymbolKind::Instance) {
+                    auto& ifaceBody = ifaceInst->as<slang::ast::InstanceSymbol>().body;
+                    for (auto& m : ifaceBody.members()) {
+                        if (m.name == ma.member.name) {
+                            auto mIt = symbolMap_.find(&m);
+                            if (mIt != symbolMap_.end()) {
+                                uint32_t sigIdx = mIt->second;
+                                assignments_.push_back({sigIdx, rhs});
+                                if (trackBlockValues_)
+                                    el_.setBlockValue(sigIdx, rhs);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Packed struct field assignment: pt.x <= val
         // Becomes: pt <= (pt & ~(mask << offset)) | ((val & mask) << offset)
         if (ma.member.kind != slang::ast::SymbolKind::Field) {
@@ -1315,8 +1386,9 @@ private:
 
         // Resolve the base signal
         const slang::ast::Symbol* baseSym = nullptr;
-        if (ma.value().kind == slang::ast::ExpressionKind::NamedValue)
-            baseSym = &ma.value().as<slang::ast::NamedValueExpression>().symbol;
+        if (ma.value().kind == slang::ast::ExpressionKind::NamedValue ||
+            ma.value().kind == slang::ast::ExpressionKind::HierarchicalValue)
+            baseSym = &static_cast<const slang::ast::ValueExpressionBase&>(ma.value()).symbol;
         if (!baseSym) {
             std::cerr << "surge: unsupported member assign base\n";
             return;
@@ -1993,12 +2065,47 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
             }
         }
 
+        // ── Handle interface instances ─────────────────────────────────────
+        // Create signals for each interface member (variables/nets in the interface body).
+        for (auto* memberPtr : allMembers) {
+            auto& member = *memberPtr;
+            if (member.kind == slang::ast::SymbolKind::Instance) {
+                auto& inst = member.as<slang::ast::InstanceSymbol>();
+                if (inst.getDefinition().definitionKind !=
+                    slang::ast::DefinitionKind::Interface)
+                    continue;
+                std::string ifacePrefix = prefix + std::string(inst.name) + ".";
+                for (auto& m : inst.body.members()) {
+                    if (m.kind == slang::ast::SymbolKind::Variable) {
+                        auto& var = m.as<slang::ast::VariableSymbol>();
+                        uint32_t w = getTypeWidth(var.getType());
+                        uint32_t idx = mod->addSignal(ifacePrefix + std::string(var.name),
+                                                       w, SignalKind::Internal);
+                        symbolMap[&var] = idx;
+                    }
+                    if (m.kind == slang::ast::SymbolKind::Net) {
+                        auto& net = m.as<slang::ast::NetSymbol>();
+                        uint32_t w = getTypeWidth(net.getType());
+                        uint32_t idx = mod->addSignal(ifacePrefix + std::string(net.name),
+                                                       w, SignalKind::Internal);
+                        symbolMap[&net] = idx;
+                    }
+                }
+            }
+        }
+
         // ── Handle child instances (recursive inline) ───────────────────────
 
         for (auto* memberPtr : allMembers) {
             auto& member = *memberPtr;
             if (member.kind == slang::ast::SymbolKind::Instance) {
                 auto& childInst = member.as<slang::ast::InstanceSymbol>();
+
+                // Skip interface instances (handled above)
+                if (childInst.getDefinition().definitionKind ==
+                    slang::ast::DefinitionKind::Interface)
+                    continue;
+
                 std::string childPrefix = prefix + std::string(childInst.name) + ".";
 
                 // Helper: map a child port (and its internal symbols) to a signal index
@@ -2031,6 +2138,25 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 for (const auto* conn : connections) {
                     auto& portSym = conn->port;
                     const auto* connExpr = conn->getExpression();
+
+                    // Interface port binding: map child's interface members
+                    // to the parent interface instance's member signals
+                    if (portSym.kind == slang::ast::SymbolKind::InterfacePort) {
+                        auto& ifacePort = portSym.as<slang::ast::InterfacePortSymbol>();
+                        auto ifaceConn = ifacePort.getConnection();
+                        const slang::ast::Symbol* parentIfaceSym = ifaceConn.first;
+                        if (parentIfaceSym &&
+                            parentIfaceSym->kind == slang::ast::SymbolKind::Instance) {
+                            auto& parentIface = parentIfaceSym->as<slang::ast::InstanceSymbol>();
+                            // Map each parent interface member to the child's references
+                            // The child module's MemberAccess will resolve through
+                            // the interface connection, and ma.member will point to
+                            // the parent interface instance's member symbols.
+                            // The symbols were already registered in the interface
+                            // instance handling above.
+                        }
+                        continue;
+                    }
 
                     // Extract the parent signal symbol from the connection expression
                     const slang::ast::Symbol* parentSym = nullptr;
@@ -2168,8 +2294,9 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 if (assign.kind == slang::ast::ExpressionKind::Assignment) {
                     auto& ae = assign.as<slang::ast::AssignmentExpression>();
                     auto& lhs = ae.left();
-                    if (lhs.kind == slang::ast::ExpressionKind::NamedValue) {
-                        auto& nv = lhs.as<slang::ast::NamedValueExpression>();
+                    if (lhs.kind == slang::ast::ExpressionKind::NamedValue ||
+                        lhs.kind == slang::ast::ExpressionKind::HierarchicalValue) {
+                        auto& nv = static_cast<const slang::ast::ValueExpressionBase&>(lhs);
                         // Use symbolMap for LHS resolution
                         auto symIt = symbolMap.find(&nv.symbol);
                         uint32_t sigIdx = UINT32_MAX;
@@ -2192,8 +2319,9 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                         uint32_t bitPos = 0;
                         for (int i = static_cast<int>(targets.size()) - 1; i >= 0; i--) {
                             auto [tExpr, tWidth] = targets[i];
-                            if (tExpr->kind == slang::ast::ExpressionKind::NamedValue) {
-                                auto& nv = tExpr->as<slang::ast::NamedValueExpression>();
+                            if (tExpr->kind == slang::ast::ExpressionKind::NamedValue ||
+                                tExpr->kind == slang::ast::ExpressionKind::HierarchicalValue) {
+                                auto& nv = static_cast<const slang::ast::ValueExpressionBase&>(*tExpr);
                                 auto symIt = symbolMap.find(&nv.symbol);
                                 uint32_t sigIdx = UINT32_MAX;
                                 if (symIt != symbolMap.end()) sigIdx = symIt->second;
@@ -2213,8 +2341,9 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                         auto& es = lhs.as<slang::ast::ElementSelectExpression>();
                         auto rhs = exprLower.lower(ae.right());
                         const slang::ast::Symbol* baseSym = nullptr;
-                        if (es.value().kind == slang::ast::ExpressionKind::NamedValue)
-                            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
+                        if (es.value().kind == slang::ast::ExpressionKind::NamedValue ||
+                            es.value().kind == slang::ast::ExpressionKind::HierarchicalValue)
+                            baseSym = &static_cast<const slang::ast::ValueExpressionBase&>(es.value()).symbol;
                         if (baseSym) {
                             auto arrIt = arrayMap.find(baseSym);
                             if (arrIt != arrayMap.end()) {
