@@ -60,28 +60,57 @@ std::optional<uint64_t> extractConstantInt(const slang::ast::Expression& expr) {
 
 // ── Array metadata ──────────────────────────────────────────────────────────
 
+struct ArrayDim {
+    uint32_t size;
+    int32_t  rangeLower;
+};
+
 struct ArrayInfo {
-    uint32_t baseSignalIndex; // signal index of element [0]
-    uint32_t size;            // number of elements
-    uint32_t elementWidth;    // bit width per element
-    int32_t  rangeLower;      // lower bound of the range (e.g., 0 for [0:7])
+    uint32_t baseSignalIndex; // signal index of first flattened element
+    uint32_t totalSize;       // total number of leaf elements
+    uint32_t elementWidth;    // bit width per leaf element
+    std::vector<ArrayDim> dims; // dimensions, outermost first
 };
 
 using ArrayMap = std::unordered_map<const slang::ast::Symbol*, ArrayInfo>;
 using SymbolMap = std::unordered_map<const slang::ast::Symbol*, uint32_t>;
 
-// Check if a type is a fixed-size unpacked array.
-std::optional<std::tuple<uint32_t, uint32_t, int32_t>>
-getUnpackedArrayInfo(const slang::ast::Type& type) {
+// Check if a type is a fixed-size unpacked array (1D or multi-dimensional).
+// Returns {elementWidth, totalSize, dims} or nullopt.
+std::optional<ArrayInfo> getUnpackedArrayInfo(const slang::ast::Type& type) {
     auto& canon = type.getCanonicalType();
-    if (canon.kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
-        auto& arrTy = canon.as<slang::ast::FixedSizeUnpackedArrayType>();
-        uint32_t elemWidth = getTypeWidth(arrTy.elementType);
-        uint32_t size = static_cast<uint32_t>(arrTy.range.fullWidth());
-        int32_t lower = arrTy.range.lower();
-        return std::make_tuple(elemWidth, size, lower);
+    if (canon.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType)
+        return std::nullopt;
+
+    ArrayInfo info{};
+    info.totalSize = 1;
+    const slang::ast::Type* cur = &canon;
+    while (cur->getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+        auto& arrTy = cur->getCanonicalType().as<slang::ast::FixedSizeUnpackedArrayType>();
+        uint32_t dimSize = static_cast<uint32_t>(arrTy.range.fullWidth());
+        int32_t dimLower = arrTy.range.lower();
+        info.dims.push_back({dimSize, dimLower});
+        info.totalSize *= dimSize;
+        cur = &arrTy.elementType;
     }
-    return std::nullopt;
+    info.elementWidth = getTypeWidth(*cur);
+    return info;
+}
+
+// Recursively create flattened signal names for multi-dimensional arrays
+void createFlattenedSignals(ir::Module& mod, const std::string& baseName,
+                            const std::vector<ArrayDim>& dims, uint32_t dimIdx,
+                            const std::string& suffix, ir::SignalKind kind,
+                            uint32_t elemWidth) {
+    if (dimIdx >= dims.size()) {
+        mod.addSignal(baseName + suffix, elemWidth, kind);
+        return;
+    }
+    auto& dim = dims[dimIdx];
+    for (uint32_t i = 0; i < dim.size; i++) {
+        std::string newSuffix = suffix + "[" + std::to_string(dim.rangeLower + static_cast<int32_t>(i)) + "]";
+        createFlattenedSignals(mod, baseName, dims, dimIdx + 1, newSuffix, kind, elemWidth);
+    }
 }
 
 // Forward declaration
@@ -167,6 +196,29 @@ public:
     ExprPtr lowerUserFunction(const slang::ast::CallExpression& call);
     uint32_t nextInlineCounter() { return inlineCounter_++; }
     const std::unordered_map<uint32_t, ExprPtr>& blockValues() const { return blockValues_; }
+
+    // Walk a chain of ElementSelectExpressions to find the base symbol and
+    // collect selectors in outermost-first order (matching dims[] order).
+    struct ArrayAccessInfo {
+        const slang::ast::Symbol* baseSym = nullptr;
+        std::vector<const slang::ast::Expression*> selectors;
+    };
+
+    ArrayAccessInfo resolveArrayAccess(const slang::ast::ElementSelectExpression& es) {
+        ArrayAccessInfo result;
+        std::vector<const slang::ast::Expression*> revSelectors;
+        const slang::ast::Expression* cur = &es;
+        while (cur->kind == slang::ast::ExpressionKind::ElementSelect) {
+            auto& sel = cur->as<slang::ast::ElementSelectExpression>();
+            revSelectors.push_back(&sel.selector());
+            cur = &sel.value();
+        }
+        if (cur->kind == slang::ast::ExpressionKind::NamedValue) {
+            result.baseSym = &cur->as<slang::ast::NamedValueExpression>().symbol;
+        }
+        result.selectors.assign(revSelectors.rbegin(), revSelectors.rend());
+        return result;
+    }
 
 private:
     Module& mod_;
@@ -361,10 +413,14 @@ private:
 
     ExprPtr lowerConversion(const slang::ast::ConversionExpression& cv) {
         auto inner = lower(cv.operand());
-        // If the operand is signed and we're widening, we need sign-extension.
-        // Mark the expression so codegen can use sext instead of zext.
-        if (cv.operand().type->isSigned()) {
+        bool srcSigned = cv.operand().type->isSigned();
+        if (srcSigned)
             inner->isSigned = true;
+
+        uint32_t targetWidth = getTypeWidth(*cv.type);
+        // Explicit sign extension when widening a signed value
+        if (targetWidth > inner->width && srcSigned) {
+            return Expr::unary(UnaryOp::SignExtend, targetWidth, inner);
         }
         return inner;
     }
@@ -563,46 +619,90 @@ private:
     }
 
     ExprPtr lowerUnpackedArraySelect(const slang::ast::ElementSelectExpression& es) {
-        // Get the array base symbol
-        const slang::ast::Symbol* baseSym = nullptr;
-        if (es.value().kind == slang::ast::ExpressionKind::NamedValue) {
-            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
-        }
-
-        if (!baseSym) {
+        auto access = resolveArrayAccess(es);
+        if (!access.baseSym) {
             std::cerr << "surge: unsupported unpacked array base expression\n";
             return Expr::constant(getTypeWidth(*es.type), 0);
         }
 
-        auto arrIt = arrayMap_.find(baseSym);
+        auto arrIt = arrayMap_.find(access.baseSym);
         if (arrIt == arrayMap_.end()) {
-            std::cerr << "surge: array info not found for '" << baseSym->name << "'\n";
+            std::cerr << "surge: array info not found for '" << access.baseSym->name << "'\n";
             return Expr::constant(getTypeWidth(*es.type), 0);
         }
 
         auto& info = arrIt->second;
 
-        // Check for constant index
-        auto constIdx = extractConstantInt(es.selector());
-        if (constIdx) {
-            int64_t idx = static_cast<int64_t>(*constIdx) - info.rangeLower;
-            if (idx < 0 || static_cast<uint32_t>(idx) >= info.size) {
-                std::cerr << "surge: array index out of bounds: " << *constIdx << "\n";
-                return Expr::constant(info.elementWidth, 0);
-            }
-            uint32_t sigIdx = info.baseSignalIndex + static_cast<uint32_t>(idx);
-            return Expr::signalRef(info.elementWidth, sigIdx);
+        // If fewer selectors than dimensions, this is a partial select (e.g., mem[i]
+        // returning a sub-array). Not yet supported as a value — only full indexing.
+        if (access.selectors.size() < info.dims.size()) {
+            std::cerr << "surge: partial array select not supported for '"
+                      << access.baseSym->name << "'\n";
+            return Expr::constant(getTypeWidth(*es.type), 0);
         }
 
-        // Dynamic index: emit ArrayElement expression
-        auto indexExpr = lower(es.selector());
-        // Subtract range lower bound if non-zero
-        if (info.rangeLower != 0) {
-            indexExpr = Expr::binary(BinaryOp::Sub, indexExpr->width, indexExpr,
-                Expr::constant(indexExpr->width, static_cast<uint64_t>(
-                    static_cast<int64_t>(info.rangeLower))));
+        // Compute flat index from all dimension selectors
+        // flatIdx = ((sel0 - lower0) * dim1_size * dim2_size ... ) + ((sel1 - lower1) * dim2_size ...) + ...
+        bool allConst = true;
+        std::vector<std::pair<std::optional<uint64_t>, ExprPtr>> indices;
+        for (size_t d = 0; d < info.dims.size(); d++) {
+            auto constIdx = extractConstantInt(*access.selectors[d]);
+            ExprPtr dynIdx;
+            if (!constIdx) {
+                dynIdx = lower(*access.selectors[d]);
+                allConst = false;
+            }
+            indices.push_back({constIdx, dynIdx});
         }
-        return Expr::arrayElement(info.elementWidth, info.baseSignalIndex, info.size, indexExpr);
+
+        if (allConst) {
+            // All constant indices — compute flat offset at compile time
+            uint32_t flatIdx = 0;
+            for (size_t d = 0; d < info.dims.size(); d++) {
+                int64_t idx = static_cast<int64_t>(*indices[d].first) - info.dims[d].rangeLower;
+                uint32_t stride = 1;
+                for (size_t d2 = d + 1; d2 < info.dims.size(); d2++)
+                    stride *= info.dims[d2].size;
+                flatIdx += static_cast<uint32_t>(idx) * stride;
+            }
+            if (flatIdx >= info.totalSize) {
+                std::cerr << "surge: array index out of bounds\n";
+                return Expr::constant(info.elementWidth, 0);
+            }
+            return Expr::signalRef(info.elementWidth, info.baseSignalIndex + flatIdx);
+        }
+
+        // Dynamic index: build flat index expression
+        ExprPtr flatExpr;
+        uint32_t idxWidth = 32; // use 32-bit arithmetic for index computation
+        for (size_t d = 0; d < info.dims.size(); d++) {
+            ExprPtr dimIdx;
+            if (indices[d].first) {
+                int64_t idx = static_cast<int64_t>(*indices[d].first) - info.dims[d].rangeLower;
+                dimIdx = Expr::constant(idxWidth, static_cast<uint64_t>(idx));
+            } else {
+                dimIdx = indices[d].second;
+                if (info.dims[d].rangeLower != 0) {
+                    dimIdx = Expr::binary(BinaryOp::Sub, idxWidth, dimIdx,
+                        Expr::constant(idxWidth, static_cast<uint64_t>(
+                            static_cast<int64_t>(info.dims[d].rangeLower))));
+                }
+            }
+            // Multiply by stride (product of remaining dimension sizes)
+            uint32_t stride = 1;
+            for (size_t d2 = d + 1; d2 < info.dims.size(); d2++)
+                stride *= info.dims[d2].size;
+            if (stride > 1)
+                dimIdx = Expr::binary(BinaryOp::Mul, idxWidth, dimIdx,
+                    Expr::constant(idxWidth, stride));
+            if (!flatExpr)
+                flatExpr = dimIdx;
+            else
+                flatExpr = Expr::binary(BinaryOp::Add, idxWidth, flatExpr, dimIdx);
+        }
+
+        return Expr::arrayElement(info.elementWidth, info.baseSignalIndex,
+                                  info.totalSize, flatExpr);
     }
 
     ExprPtr lowerRangeSelect(const slang::ast::RangeSelectExpression& rs) {
@@ -1021,26 +1121,23 @@ private:
     }
 
     void lowerIndexedAssignment(const slang::ast::ElementSelectExpression& es, ExprPtr rhs) {
-        // Get array base symbol
-        const slang::ast::Symbol* baseSym = nullptr;
-        if (es.value().kind == slang::ast::ExpressionKind::NamedValue) {
-            baseSym = &es.value().as<slang::ast::NamedValueExpression>().symbol;
-        }
+        // Resolve the chain of ElementSelects to find base symbol
+        auto access = el_.resolveArrayAccess(es);
 
-        if (!baseSym) {
+        if (!access.baseSym) {
             std::cerr << "surge: unsupported indexed LHS base\n";
             return;
         }
 
         auto& arrayMap = el_.arrayMap();
-        auto arrIt = arrayMap.find(baseSym);
+        auto arrIt = arrayMap.find(access.baseSym);
         if (arrIt == arrayMap.end()) {
             // Packed bit assignment: sig[idx] <= rhs
-            // Becomes: sig <= (sig & ~(1 << idx)) | ((rhs & 1) << idx)
-            uint32_t sigIdx = resolveSignalIndex(*baseSym);
+            // Only valid for single-level select (no chain)
+            uint32_t sigIdx = resolveSignalIndex(*access.baseSym);
             if (sigIdx == UINT32_MAX) {
                 std::cerr << "surge: unknown signal for packed bit assign '"
-                          << baseSym->name << "'\n";
+                          << access.baseSym->name << "'\n";
                 return;
             }
             auto& sig = mod_.signals[sigIdx];
@@ -1071,45 +1168,78 @@ private:
 
         auto& info = arrIt->second;
 
-        // Check for constant index
-        auto constIdx = extractConstantInt(es.selector());
-        if (constIdx) {
-            int64_t idx = static_cast<int64_t>(*constIdx) - info.rangeLower;
-            if (idx < 0 || static_cast<uint32_t>(idx) >= info.size) {
-                std::cerr << "surge: array assignment index out of bounds\n";
-                return;
+        // Compute flat index from all dimension selectors
+        bool allConst = true;
+        std::vector<std::pair<std::optional<uint64_t>, ExprPtr>> indices;
+        for (size_t d = 0; d < info.dims.size() && d < access.selectors.size(); d++) {
+            auto constIdx = extractConstantInt(*access.selectors[d]);
+            ExprPtr dynIdx;
+            if (!constIdx) {
+                dynIdx = el_.lower(*access.selectors[d]);
+                // Check if it resolved to a constant (e.g., loop variable)
+                if (dynIdx->kind == ExprKind::Constant) {
+                    constIdx = dynIdx->constVal;
+                } else {
+                    allConst = false;
+                }
             }
-            uint32_t sigIdx = info.baseSignalIndex + static_cast<uint32_t>(idx);
-            assignments_.push_back({sigIdx, rhs});
-            return;
+            indices.push_back({constIdx, dynIdx});
         }
 
-        // Try lowering the selector — it may resolve to a constant (e.g., loop variable)
-        auto selExpr = el_.lower(es.selector());
-        // Subtract range lower bound if non-zero
-        if (info.rangeLower != 0) {
-            selExpr = Expr::binary(BinaryOp::Sub, selExpr->width, selExpr,
-                Expr::constant(selExpr->width, static_cast<uint64_t>(
-                    static_cast<int64_t>(info.rangeLower))));
-        }
-
-        // Check if selector resolved to a constant after lowering
-        if (selExpr->kind == ExprKind::Constant) {
-            uint32_t idx = static_cast<uint32_t>(selExpr->constVal);
-            if (idx < info.size) {
-                assignments_.push_back({info.baseSignalIndex + idx, rhs});
+        if (allConst) {
+            uint32_t flatIdx = 0;
+            for (size_t d = 0; d < info.dims.size(); d++) {
+                int64_t idx = static_cast<int64_t>(*indices[d].first) - info.dims[d].rangeLower;
+                uint32_t stride = 1;
+                for (size_t d2 = d + 1; d2 < info.dims.size(); d2++)
+                    stride *= info.dims[d2].size;
+                flatIdx += static_cast<uint32_t>(idx) * stride;
+            }
+            if (flatIdx < info.totalSize) {
+                uint32_t sigIdx = info.baseSignalIndex + flatIdx;
+                assignments_.push_back({sigIdx, rhs});
+                if (trackBlockValues_)
+                    el_.setBlockValue(sigIdx, rhs);
             } else {
-                std::cerr << "surge: array assignment index out of bounds (resolved constant)\n";
+                std::cerr << "surge: array assignment index out of bounds\n";
             }
             return;
         }
 
-        // Dynamic index: emit a single computed array store
+        // Dynamic index: build flat index expression
+        ExprPtr flatExpr;
+        uint32_t idxWidth = 32;
+        for (size_t d = 0; d < info.dims.size(); d++) {
+            ExprPtr dimIdx;
+            if (indices[d].first) {
+                int64_t idx = static_cast<int64_t>(*indices[d].first) - info.dims[d].rangeLower;
+                dimIdx = Expr::constant(idxWidth, static_cast<uint64_t>(idx));
+            } else {
+                dimIdx = indices[d].second;
+                if (info.dims[d].rangeLower != 0) {
+                    dimIdx = Expr::binary(BinaryOp::Sub, idxWidth, dimIdx,
+                        Expr::constant(idxWidth, static_cast<uint64_t>(
+                            static_cast<int64_t>(info.dims[d].rangeLower))));
+                }
+            }
+            uint32_t stride = 1;
+            for (size_t d2 = d + 1; d2 < info.dims.size(); d2++)
+                stride *= info.dims[d2].size;
+            if (stride > 1)
+                dimIdx = Expr::binary(BinaryOp::Mul, idxWidth, dimIdx,
+                    Expr::constant(idxWidth, stride));
+            if (!flatExpr)
+                flatExpr = dimIdx;
+            else
+                flatExpr = Expr::binary(BinaryOp::Add, idxWidth, flatExpr, dimIdx);
+        }
+
+        // Emit computed array store
         Assignment a;
         a.targetIndex  = info.baseSignalIndex;
         a.value        = rhs;
-        a.indexExpr    = selExpr;
-        a.arraySize    = info.size;
+        a.indexExpr    = flatExpr;
+        a.arraySize    = info.totalSize;
         a.elementWidth = info.elementWidth;
         assignments_.push_back(std::move(a));
     }
@@ -1834,14 +1964,10 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 if (symbolMap.count(&var)) continue;
                 auto arrInfo = getUnpackedArrayInfo(var.getType());
                 if (arrInfo) {
-                    auto [elemWidth, arrSize, rangeLower] = *arrInfo;
-                    uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
-                    for (uint32_t i = 0; i < arrSize; i++) {
-                        std::string elemName = prefix + std::string(var.name)
-                            + "[" + std::to_string(i) + "]";
-                        mod->addSignal(elemName, elemWidth, SignalKind::Internal);
-                    }
-                    arrayMap[&var] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
+                    arrInfo->baseSignalIndex = static_cast<uint32_t>(mod->signals.size());
+                    createFlattenedSignals(*mod, prefix + std::string(var.name),
+                        arrInfo->dims, 0, "", SignalKind::Internal, arrInfo->elementWidth);
+                    arrayMap[&var] = *arrInfo;
                 } else {
                     uint32_t w = getTypeWidth(var.getType());
                     uint32_t idx = mod->addSignal(prefix + std::string(var.name),
@@ -1854,14 +1980,10 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                 if (symbolMap.count(&net)) continue;
                 auto arrInfo = getUnpackedArrayInfo(net.getType());
                 if (arrInfo) {
-                    auto [elemWidth, arrSize, rangeLower] = *arrInfo;
-                    uint32_t baseIdx = static_cast<uint32_t>(mod->signals.size());
-                    for (uint32_t i = 0; i < arrSize; i++) {
-                        std::string elemName = prefix + std::string(net.name)
-                            + "[" + std::to_string(i) + "]";
-                        mod->addSignal(elemName, elemWidth, SignalKind::Internal);
-                    }
-                    arrayMap[&net] = ArrayInfo{baseIdx, arrSize, elemWidth, rangeLower};
+                    arrInfo->baseSignalIndex = static_cast<uint32_t>(mod->signals.size());
+                    createFlattenedSignals(*mod, prefix + std::string(net.name),
+                        arrInfo->dims, 0, "", SignalKind::Internal, arrInfo->elementWidth);
+                    arrayMap[&net] = *arrInfo;
                 } else {
                     uint32_t w = getTypeWidth(net.getType());
                     uint32_t idx = mod->addSignal(prefix + std::string(net.name),
@@ -2100,8 +2222,8 @@ std::unique_ptr<Module> buildFromFiles(const std::vector<std::string>& paths) {
                                 auto constIdx = extractConstantInt(es.selector());
                                 if (constIdx) {
                                     uint32_t idx = static_cast<uint32_t>(*constIdx)
-                                        - static_cast<uint32_t>(info.rangeLower);
-                                    if (idx < info.size) {
+                                        - static_cast<uint32_t>(info.dims[0].rangeLower);
+                                    if (idx < info.totalSize) {
                                         proc.assignments.push_back(
                                             {info.baseSignalIndex + idx, rhs});
                                     }

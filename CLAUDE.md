@@ -2,13 +2,12 @@
 
 ## What To Do Next
 
-**Sprint 20 complete.** Task output arguments.
+**Sprint 21 complete.** Sign extension fix, 2D arrays.
 
 Next priorities:
 1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-2. **Memory (2D arrays)**: Larger memories, block RAM modeling.
-3. **Testbench API**: C++ API for driving inputs programmatically.
-4. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
+2. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
+3. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
 
 ### Project Structure
 ```
@@ -52,6 +51,7 @@ surge/
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
     enum_fsm.sv
+    mem2d_test.sv
   bench/
     run_bench.sh            # Surge vs Verilator benchmark
 ```
@@ -346,6 +346,23 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 ### Sprint 20: Task Output Arguments (complete)
 - **Task output arguments**: `lowerTaskCall()` in StmtLowering handles tasks with `output` and `inout` port bindings. Detects argument direction via `ArgumentDirection`, unwraps `AssignmentExpression` wrappers on actual arguments, and writes back final block values to actual LHS after task body execution. Also handles `inout` args (read input value + write back).
 - Verified cycle-accurate against Verilator with clamp task using output port.
+
+### Sprint 21: Sign Extension + 2D Arrays (complete)
+- **Sign extension bugfix**: `lowerConversion()` now emits explicit `UnaryOp::SignExtend` when widening a signed value. Previously, signed-to-wider conversions (e.g., `32'(signed'(s_val))`) were zero-extended instead of sign-extended. New `SignExtend` unary op in IR + `CreateSExt` in codegen.
+- **Multi-dimensional unpacked arrays**: `ArrayInfo` restructured with `std::vector<ArrayDim>` for N-dimensional support. `getUnpackedArrayInfo()` recursively unwraps nested `FixedSizeUnpackedArrayType`. `createFlattenedSignals()` generates hierarchical signal names (e.g., `mem[0][0]`...`mem[3][3]`).
+- **2D array element access (RHS)**: `resolveArrayAccess()` walks chain of `ElementSelectExpression` nodes to collect all dimension selectors. Computes flat index: `outerIdx * innerStride + innerIdx`. Supports constant and dynamic indices.
+- **2D array element write (LHS)**: Same chain-walking logic in `lowerIndexedAssignment()`. Constant indices → direct signal assignment. Dynamic indices → computed array store with flat index expression.
+- New test: `mem2d_test.sv` — 4x4 byte memory with LFSR-driven random reads/writes, checksum accumulator. Verified cycle-accurate against Verilator (result=0xb2 at 20 cycles).
+
+**Performance (1M cycles, macOS ARM64):**
+| Design | Surge (O2) | Verilator 5.045 | Speedup | Correctness |
+|--------|-----------|-----------------|---------|-------------|
+| LFSR 8-bit | **262 MHz** | 23 MHz | **11.4x** | PASS |
+| ALU+Regfile | **130 MHz** | 33 MHz | **3.9x** | PASS |
+| RISC-V 5-Stage | **66 MHz** | 15 MHz | **4.4x** | PASS |
+| CRC-32 | **59 MHz** | — | — | PASS |
+| SPI Master | **132 MHz** | — | — | PASS |
+| 2D Memory 4x4 | **109 MHz** | — | — | PASS |
 
 ## Research
 

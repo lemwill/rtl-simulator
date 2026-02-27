@@ -32,7 +32,7 @@ enum class ExprKind {
     ArrayElement, // dynamic unpacked array element access
 };
 
-enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor, Popcount };
+enum class UnaryOp { Not, Negate, ReduceAnd, ReduceOr, ReduceXor, Popcount, SignExtend };
 
 enum class BinaryOp {
     And, Or, Xor,
