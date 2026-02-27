@@ -2,12 +2,13 @@
 
 ## What To Do Next
 
-**Sprint 22 complete.** Interface support.
+**Sprint 23 complete.** Modport interfaces, casez/casex wildcards, task support.
 
 Next priorities:
 1. **Multi-driven signal resolution**: Arbitrate multiple drivers to same signal.
-2. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
-3. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
+2. **Blocking assignments in always_ff**: Support mixing `=` and `<=` in sequential blocks.
+3. **Automatic cast/conversion handling**: Width mismatches, sign extension in expressions.
+4. **MLIR/CIRCT migration path**: Design IR to be CIRCT-aligned for future synthesis backend.
 
 ### Project Structure
 ```
@@ -51,6 +52,9 @@ surge/
     multi_file/       # Multi-file test (sub_counter.sv + top_multi.sv)
     generate_chain.sv
     iface_bus.sv
+    iface_modport.sv
+    casez_decode.sv
+    task_test.sv
     enum_fsm.sv
     mem2d_test.sv
   bench/
@@ -364,6 +368,13 @@ RISC-V pipeline: 33% improvement from identity-mux elimination (51→68 MHz).
 | CRC-32 | **59 MHz** | — | — | PASS |
 | SPI Master | **132 MHz** | — | — | PASS |
 | 2D Memory 4x4 | **109 MHz** | — | — | PASS |
+
+### Sprint 23: Modport Interfaces, casez/casex, Task Support (complete)
+- **Modport interfaces**: `ModportPortSymbol` resolution in interface instance handling. When creating interface signals, also register `ModportPort` symbols and their `internalSymbol` pointers in symbolMap. Handles `simple_if.src`/`simple_if.dst` port qualifications.
+- **HierarchicalValue everywhere**: Added `ExpressionKind::HierarchicalValue` handling alongside `NamedValue` in `resolveArrayAccess()`, `lowerRangeAssignment()`, `lowerMemberAssignment()`, continuous assign LHS, concat LHS, and `unwrapNamedSymbol()`. slang uses HierarchicalValue for cross-scope references (interface members).
+- **casez/casex wildcard matching**: Detect `CaseStatementCondition::WildcardJustZ`/`WildcardXOrZ`. For patterns with unknown bits (X/Z/`?`), extract known-bits mask via `SVInt::operator[]` + `logic_t::isUnknown()`. Generate masked comparison: `(selector & knownMask) == (pattern & knownMask)`. Falls back to `IntegerLiteral::getValue()` when `getConstant()` returns null for wildcard patterns.
+- **Task call side-effect propagation**: Task body assignments to module-level signals were silently dropped. Fix: merge `bodyLower.assignments()` into parent after task body lowering (in addition to output argument writeback).
+- New tests: `iface_modport.sv`, `casez_decode.sv`, `task_test.sv`. All verified cycle-accurate against Verilator.
 
 ### Sprint 22: Interface Support (complete)
 - **SystemVerilog interfaces**: Interface instances create signals for each member variable/net (e.g., `simple_bus bus()` creates `bus.data`, `bus.valid`, `bus.ready`). Interface port binding via `InterfacePortSymbol::getConnection()` maps child module ports to parent interface instance members.
